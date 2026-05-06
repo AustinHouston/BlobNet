@@ -9,17 +9,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from GombNet.synthetic import (
-    RandomGaussianConfig,
-    generate_random_gaussian_sample,
-    save_gaussian_dataset,
-    save_gaussian_dataset_splits,
-    save_gaussian_preview,
+    RandomMicroscopeImageConfig,
+    generate_microscope_image,
+    save_microscope_dataset,
+    save_microscope_dataset_splits,
+    save_microscope_preview,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate an edge-aware synthetic Gaussian dataset for the Blob-Net U-Net pipeline."
+        description="Generate an edge-aware synthetic microscope-image dataset for the Blob-Net U-Net pipeline."
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-samples", type=int, default=256)
@@ -38,12 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-max", type=float, default=4.3)
     parser.add_argument("--background-min", type=float, default=0.0)
     parser.add_argument("--background-max", type=float, default=0.30)
+    parser.add_argument("--inhom-background-min", type=float, default=0.0)
+    parser.add_argument("--inhom-background-max", type=float, default=0.0)
     parser.add_argument("--low-freq-noise-min", type=float, default=0.08)
     parser.add_argument("--low-freq-noise-max", type=float, default=0.30)
     parser.add_argument("--read-noise-min", type=float, default=0.03)
     parser.add_argument("--read-noise-max", type=float, default=0.14)
-    parser.add_argument("--poisson-counts-min", type=float, default=50.0)
-    parser.add_argument("--poisson-counts-max", type=float, default=25000.0)
+    parser.add_argument("--total-counts-min", type=float, default=50.0)
+    parser.add_argument("--total-counts-max", type=float, default=25000.0)
+    parser.add_argument("--counts-per-pixel-min", type=float, default=None)
+    parser.add_argument("--counts-per-pixel-max", type=float, default=None)
     parser.add_argument("--blur-sigma-min", type=float, default=0.3)
     parser.add_argument("--blur-sigma-max", type=float, default=1.1)
     parser.add_argument("--edge-padding", type=int, default=24)
@@ -51,8 +55,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> RandomGaussianConfig:
-    return RandomGaussianConfig(
+def build_config(args: argparse.Namespace) -> RandomMicroscopeImageConfig:
+    using_counts_per_pixel = (
+        args.counts_per_pixel_min is not None
+        or args.counts_per_pixel_max is not None
+    )
+    if using_counts_per_pixel and (
+        args.counts_per_pixel_min is None
+        or args.counts_per_pixel_max is None
+    ):
+        raise ValueError(
+            "--counts-per-pixel-min and --counts-per-pixel-max must be set together."
+        )
+
+    total_counts_range = None if using_counts_per_pixel else (
+        args.total_counts_min,
+        args.total_counts_max,
+    )
+    counts_per_pixel_range = (
+        (args.counts_per_pixel_min, args.counts_per_pixel_max)
+        if using_counts_per_pixel
+        else None
+    )
+
+    return RandomMicroscopeImageConfig(
         image_shape=(args.height, args.width),
         min_atoms=args.min_atoms,
         max_atoms=args.max_atoms,
@@ -60,9 +86,14 @@ def build_config(args: argparse.Namespace) -> RandomGaussianConfig:
         min_separation_range=(args.min_separation_range_min, args.min_separation_range_max),
         sigma_range=(args.sigma_min, args.sigma_max),
         background_range=(args.background_min, args.background_max),
+        inhomogeneous_background_range=(
+            args.inhom_background_min,
+            args.inhom_background_max,
+        ),
         low_frequency_noise_range=(args.low_freq_noise_min, args.low_freq_noise_max),
         read_noise_std_range=(args.read_noise_min, args.read_noise_max),
-        poisson_counts_range=(args.poisson_counts_min, args.poisson_counts_max),
+        total_counts_range=total_counts_range,
+        counts_per_pixel_range=counts_per_pixel_range,
         blur_sigma_range=(args.blur_sigma_min, args.blur_sigma_max),
         edge_padding=args.edge_padding,
     )
@@ -78,7 +109,7 @@ def main() -> int:
         raise ValueError("--train-samples, --val-samples, and --test-samples must all be set together.")
 
     if use_explicit_splits:
-        saved = save_gaussian_dataset_splits(
+        saved = save_microscope_dataset_splits(
             output_dir=args.output_dir,
             train_samples=args.train_samples,
             val_samples=args.val_samples,
@@ -88,21 +119,21 @@ def main() -> int:
         )
         print(
             f"Saved train={len(saved['train'])}, val={len(saved['val'])}, test={len(saved['test'])} "
-            f"samples to {args.output_dir}",
+            f"images to {args.output_dir}",
             flush=True,
         )
     else:
-        saved = save_gaussian_dataset(
+        saved = save_microscope_dataset(
             output_dir=args.output_dir,
             num_samples=args.num_samples,
             config=config,
             seed=args.seed,
         )
-        print(f"Saved {len(saved)} samples to {args.output_dir}", flush=True)
+        print(f"Saved {len(saved)} images to {args.output_dir}", flush=True)
 
     if args.preview_path is not None:
-        preview = generate_random_gaussian_sample(config)
-        saved_path = save_gaussian_preview(preview, args.preview_path)
+        preview_image = generate_microscope_image(config)
+        saved_path = save_microscope_preview(preview_image, args.preview_path)
         print(f"Saved preview image to {saved_path}", flush=True)
     return 0
 
