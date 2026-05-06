@@ -26,7 +26,7 @@ from GombNet.real_image import (
 from GombNet.synthetic import (
     AseStructureProjectionConfig,
     PeriodicLatticeConfig,
-    RandomGaussianConfig,
+    RandomMicroscopeImageConfig,
     build_generalization_dataloaders,
 )
 from GombNet.utils import resolve_torch_device, train_model
@@ -78,12 +78,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-max", type=float, default=4.3)
     parser.add_argument("--background-min", type=float, default=0.0)
     parser.add_argument("--background-max", type=float, default=0.30)
+    parser.add_argument("--inhom-background-min", type=float, default=0.0)
+    parser.add_argument("--inhom-background-max", type=float, default=0.0)
     parser.add_argument("--low-freq-noise-min", type=float, default=0.08)
     parser.add_argument("--low-freq-noise-max", type=float, default=0.30)
     parser.add_argument("--read-noise-min", type=float, default=0.03)
     parser.add_argument("--read-noise-max", type=float, default=0.14)
-    parser.add_argument("--poisson-counts-min", type=float, default=50.0)
-    parser.add_argument("--poisson-counts-max", type=float, default=25000.0)
+    parser.add_argument("--total-counts-min", type=float, default=50.0)
+    parser.add_argument("--total-counts-max", type=float, default=25000.0)
+    parser.add_argument("--counts-per-pixel-min", type=float, default=None)
+    parser.add_argument("--counts-per-pixel-max", type=float, default=None)
     parser.add_argument("--blur-sigma-min", type=float, default=0.3)
     parser.add_argument("--blur-sigma-max", type=float, default=1.1)
     parser.add_argument("--edge-padding", type=int, default=24)
@@ -113,8 +117,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def make_random_config(args: argparse.Namespace) -> RandomGaussianConfig:
-    return RandomGaussianConfig(
+def make_microscope_config(args: argparse.Namespace) -> RandomMicroscopeImageConfig:
+    using_counts_per_pixel = (
+        args.counts_per_pixel_min is not None
+        or args.counts_per_pixel_max is not None
+    )
+    if using_counts_per_pixel and (
+        args.counts_per_pixel_min is None
+        or args.counts_per_pixel_max is None
+    ):
+        raise ValueError(
+            "--counts-per-pixel-min and --counts-per-pixel-max must be set together."
+        )
+
+    total_counts_range = None if using_counts_per_pixel else (
+        args.total_counts_min,
+        args.total_counts_max,
+    )
+    counts_per_pixel_range = (
+        (args.counts_per_pixel_min, args.counts_per_pixel_max)
+        if using_counts_per_pixel
+        else None
+    )
+
+    return RandomMicroscopeImageConfig(
         image_shape=(args.height, args.width),
         min_atoms=args.min_atoms,
         max_atoms=args.max_atoms,
@@ -122,9 +148,14 @@ def make_random_config(args: argparse.Namespace) -> RandomGaussianConfig:
         min_separation_range=(args.min_separation_range_min, args.min_separation_range_max),
         sigma_range=(args.sigma_min, args.sigma_max),
         background_range=(args.background_min, args.background_max),
+        inhomogeneous_background_range=(
+            args.inhom_background_min,
+            args.inhom_background_max,
+        ),
         low_frequency_noise_range=(args.low_freq_noise_min, args.low_freq_noise_max),
         read_noise_std_range=(args.read_noise_min, args.read_noise_max),
-        poisson_counts_range=(args.poisson_counts_min, args.poisson_counts_max),
+        total_counts_range=total_counts_range,
+        counts_per_pixel_range=counts_per_pixel_range,
         blur_sigma_range=(args.blur_sigma_min, args.blur_sigma_max),
         edge_padding=args.edge_padding,
     )
@@ -132,7 +163,7 @@ def make_random_config(args: argparse.Namespace) -> RandomGaussianConfig:
 
 def make_periodic_config(
     args: argparse.Namespace,
-    random_config: RandomGaussianConfig,
+    microscope_config: RandomMicroscopeImageConfig,
     lattice_type: str,
 ) -> PeriodicLatticeConfig:
     return PeriodicLatticeConfig(
@@ -141,18 +172,21 @@ def make_periodic_config(
         lattice_spacing_range=(args.periodic_spacing_min, args.periodic_spacing_max),
         jitter_std_range=(args.periodic_jitter_min, args.periodic_jitter_max),
         vacancy_fraction_range=(args.periodic_vacancy_min, args.periodic_vacancy_max),
-        sigma_range=random_config.sigma_range,
-        intensity_range=random_config.intensity_range,
-        target_sigma=random_config.target_sigma,
-        background_range=random_config.background_range,
-        gradient_range=random_config.gradient_range,
-        low_frequency_noise_range=random_config.low_frequency_noise_range,
-        low_frequency_sigma_fraction_range=random_config.low_frequency_sigma_fraction_range,
-        read_noise_std_range=random_config.read_noise_std_range,
-        poisson_counts_range=random_config.poisson_counts_range,
-        blur_sigma_range=random_config.blur_sigma_range,
-        normalize_input=random_config.normalize_input,
-        clamp_target=random_config.clamp_target,
+        sigma_range=microscope_config.sigma_range,
+        intensity_range=microscope_config.intensity_range,
+        target_sigma=microscope_config.target_sigma,
+        background_range=microscope_config.background_range,
+        gradient_range=microscope_config.gradient_range,
+        inhomogeneous_background_range=microscope_config.inhomogeneous_background_range,
+        inhomogeneous_background_sigma_fraction_range=microscope_config.inhomogeneous_background_sigma_fraction_range,
+        low_frequency_noise_range=microscope_config.low_frequency_noise_range,
+        low_frequency_sigma_fraction_range=microscope_config.low_frequency_sigma_fraction_range,
+        read_noise_std_range=microscope_config.read_noise_std_range,
+        total_counts_range=microscope_config.total_counts_range,
+        counts_per_pixel_range=microscope_config.counts_per_pixel_range,
+        blur_sigma_range=microscope_config.blur_sigma_range,
+        normalize_input=microscope_config.normalize_input,
+        clamp_target=microscope_config.clamp_target,
         min_atoms=args.periodic_min_atoms,
         edge_padding=args.edge_padding,
     )
@@ -160,25 +194,28 @@ def make_periodic_config(
 
 def make_structure_configs(
     args: argparse.Namespace,
-    random_config: RandomGaussianConfig,
+    microscope_config: RandomMicroscopeImageConfig,
 ) -> Dict[str, AseStructureProjectionConfig]:
     common = dict(
         image_shape=(args.structure_height, args.structure_width),
         pixel_size_angstrom=args.structure_pixel_size_angstrom,
         rotation_range=(0.0, 180.0),
         position_jitter_std_range=(args.structure_jitter_min, args.structure_jitter_max),
-        sigma_range=random_config.sigma_range,
-        intensity_range=random_config.intensity_range,
-        target_sigma=random_config.target_sigma,
-        background_range=random_config.background_range,
-        gradient_range=random_config.gradient_range,
-        low_frequency_noise_range=random_config.low_frequency_noise_range,
-        low_frequency_sigma_fraction_range=random_config.low_frequency_sigma_fraction_range,
-        read_noise_std_range=random_config.read_noise_std_range,
-        poisson_counts_range=random_config.poisson_counts_range,
-        blur_sigma_range=random_config.blur_sigma_range,
-        normalize_input=random_config.normalize_input,
-        clamp_target=random_config.clamp_target,
+        sigma_range=microscope_config.sigma_range,
+        intensity_range=microscope_config.intensity_range,
+        target_sigma=microscope_config.target_sigma,
+        background_range=microscope_config.background_range,
+        gradient_range=microscope_config.gradient_range,
+        inhomogeneous_background_range=microscope_config.inhomogeneous_background_range,
+        inhomogeneous_background_sigma_fraction_range=microscope_config.inhomogeneous_background_sigma_fraction_range,
+        low_frequency_noise_range=microscope_config.low_frequency_noise_range,
+        low_frequency_sigma_fraction_range=microscope_config.low_frequency_sigma_fraction_range,
+        read_noise_std_range=microscope_config.read_noise_std_range,
+        total_counts_range=microscope_config.total_counts_range,
+        counts_per_pixel_range=microscope_config.counts_per_pixel_range,
+        blur_sigma_range=microscope_config.blur_sigma_range,
+        normalize_input=microscope_config.normalize_input,
+        clamp_target=microscope_config.clamp_target,
         edge_padding=args.edge_padding,
     )
     return {
@@ -233,10 +270,10 @@ def train_and_evaluate(args: argparse.Namespace) -> tuple[torch.nn.Module, torch
     torch.manual_seed(args.seed)
     device = resolve_torch_device(args.device, verbose=True)
 
-    random_config = make_random_config(args)
-    cubic_config = make_periodic_config(args, random_config, "cubic")
-    hexagonal_config = make_periodic_config(args, random_config, "hexagonal")
-    structure_configs = make_structure_configs(args, random_config)
+    microscope_config = make_microscope_config(args)
+    cubic_config = make_periodic_config(args, microscope_config, "cubic")
+    hexagonal_config = make_periodic_config(args, microscope_config, "hexagonal")
+    structure_configs = make_structure_configs(args, microscope_config)
     periodic_cases = ["random", "cubic", "hexagonal"]
     structure_cases = ["graphene", "ws2", "sto"] if args.structure_test_samples > 0 else []
     all_cases = periodic_cases + structure_cases
@@ -251,16 +288,19 @@ def train_and_evaluate(args: argparse.Namespace) -> tuple[torch.nn.Module, torch
         flush=True,
     )
     print(
-        "Random training config: "
-        f"min_atoms={random_config.min_atoms}, max_atoms={random_config.max_atoms}, "
-        f"min_sep={random_config.min_separation}, min_sep_range={random_config.min_separation_range}, "
-        f"sigma_range={random_config.sigma_range}, edge_padding={random_config.edge_padding}",
+        "Microscope-image training config: "
+        f"min_atoms={microscope_config.min_atoms}, max_atoms={microscope_config.max_atoms}, "
+        f"min_sep={microscope_config.min_separation}, min_sep_range={microscope_config.min_separation_range}, "
+        f"sigma_range={microscope_config.sigma_range}, "
+        f"total_counts={microscope_config.total_counts_range}, "
+        f"counts_per_pixel={microscope_config.counts_per_pixel_range}, "
+        f"edge_padding={microscope_config.edge_padding}",
         flush=True,
     )
     print(f"U-Net channel widths: {args.num_filters}", flush=True)
 
     train_loader, val_loader, test_loaders = build_generalization_dataloaders(
-        random_config=random_config,
+        microscope_config=microscope_config,
         cubic_config=cubic_config,
         hexagonal_config=hexagonal_config,
         structure_configs=structure_configs if structure_cases else None,

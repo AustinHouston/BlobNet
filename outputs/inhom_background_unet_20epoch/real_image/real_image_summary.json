@@ -1,0 +1,50 @@
+{
+  "real_data_path": "real_data/WS2.emd",
+  "shape": [
+    1024,
+    1024
+  ],
+  "pixel_size_angstrom": 0.1062231596676199,
+  "real_threshold_rel": 0.65,
+  "variants": [
+    {
+      "variant": "raw_percentile",
+      "detections": 190,
+      "heatmap_mean": 0.023567933589220047,
+      "heatmap_max": 0.7790137529373169
+    },
+    {
+      "variant": "flatfield_normalized",
+      "detections": 519,
+      "heatmap_mean": 0.026881437748670578,
+      "heatmap_max": 0.7049195170402527
+    },
+    {
+      "variant": "background_subtracted",
+      "detections": 401,
+      "heatmap_mean": 0.024387722834944725,
+      "heatmap_max": 0.7272366881370544
+    }
+  ],
+  "preferred_variant": "flatfield_normalized",
+  "crop_boxes_yxyx": [
+    [
+      63,
+      191,
+      17,
+      145
+    ],
+    [
+      896,
+      1024,
+      638,
+      766
+    ],
+    [
+      87,
+      215,
+      134,
+      262
+    ]
+  ]
+}

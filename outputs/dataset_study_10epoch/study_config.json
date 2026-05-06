@@ -1,0 +1,360 @@
+{
+  "args": {
+    "output_dir": "outputs/dataset_study_10epoch",
+    "epochs": 10,
+    "early_stopping_patience": null,
+    "early_stopping_min_delta": 0.0005,
+    "batch_size": 16,
+    "train_samples": 2048,
+    "val_samples": 512,
+    "test_samples": 256,
+    "height": 512,
+    "width": 512,
+    "min_atoms": 550,
+    "max_atoms": 800,
+    "min_separation": 14.5,
+    "min_separation_range_min": 12.5,
+    "min_separation_range_max": 16.7,
+    "tight_spacing_min": 14.0,
+    "tight_spacing_max": 15.2,
+    "tight_spacing_jitter_min": 0.03,
+    "tight_spacing_jitter_max": 0.08,
+    "tight_min_spacing_fraction": 0.86,
+    "sigma_min": 2.8,
+    "sigma_max": 4.3,
+    "background_min": 0.0,
+    "background_max": 0.3,
+    "inhom_background_min": 0.0,
+    "inhom_background_max": 0.0,
+    "low_freq_noise_min": 0.08,
+    "low_freq_noise_max": 0.3,
+    "read_noise_min": 0.03,
+    "read_noise_max": 0.14,
+    "total_counts_min": 50.0,
+    "total_counts_max": 25000.0,
+    "counts_per_pixel_min": null,
+    "counts_per_pixel_max": null,
+    "blur_sigma_min": 0.3,
+    "blur_sigma_max": 1.1,
+    "edge_padding": 24,
+    "lattice_spacing_min": 12.5,
+    "lattice_spacing_max": 16.7,
+    "lattice_jitter_min": 0.0,
+    "lattice_jitter_max": 0.25,
+    "lattice_vacancy_min": 0.0,
+    "lattice_vacancy_max": 0.03,
+    "lattice_rotation_min": 0.0,
+    "lattice_rotation_max": 180.0,
+    "lattice_min_atoms": 400,
+    "seed": 0,
+    "lr": 0.001,
+    "dropout": 0.2,
+    "num_filters": [
+      32,
+      64,
+      128,
+      256
+    ],
+    "device": "auto",
+    "progress_interval": 25,
+    "threshold_rel": 0.35,
+    "match_distance": 3.0,
+    "num_workers": 0,
+    "offset_plot_range": 0.6,
+    "offset_bins": 181,
+    "gallery_sample_index": 0,
+    "output_sample_indices": [
+      0,
+      1,
+      2
+    ]
+  },
+  "datasets": {
+    "random_min_distance": {
+      "class": "RandomMicroscopeImageConfig",
+      "config": {
+        "image_shape": [
+          512,
+          512
+        ],
+        "sigma_range": [
+          2.8,
+          4.3
+        ],
+        "intensity_range": [
+          0.3,
+          1.0
+        ],
+        "target_sigma": 0.9,
+        "background_range": [
+          0.0,
+          0.3
+        ],
+        "gradient_range": [
+          -0.08,
+          0.08
+        ],
+        "inhomogeneous_background_range": [
+          0.0,
+          0.0
+        ],
+        "inhomogeneous_background_sigma_fraction_range": [
+          0.18,
+          0.45
+        ],
+        "low_frequency_noise_range": [
+          0.08,
+          0.3
+        ],
+        "low_frequency_sigma_fraction_range": [
+          0.04,
+          0.12
+        ],
+        "read_noise_std_range": [
+          0.03,
+          0.14
+        ],
+        "total_counts_range": [
+          50.0,
+          25000.0
+        ],
+        "counts_per_pixel_range": null,
+        "blur_sigma_range": [
+          0.3,
+          1.1
+        ],
+        "edge_padding": 24,
+        "normalize_input": true,
+        "clamp_target": true,
+        "min_atoms": 550,
+        "max_atoms": 800,
+        "min_separation": 14.5,
+        "min_separation_range": [
+          12.5,
+          16.7
+        ]
+      }
+    },
+    "tight_random_spacing": {
+      "class": "TightSpacingRandomMicroscopeImageConfig",
+      "config": {
+        "image_shape": [
+          512,
+          512
+        ],
+        "sigma_range": [
+          2.8,
+          4.3
+        ],
+        "intensity_range": [
+          0.3,
+          1.0
+        ],
+        "target_sigma": 0.9,
+        "background_range": [
+          0.0,
+          0.3
+        ],
+        "gradient_range": [
+          -0.08,
+          0.08
+        ],
+        "inhomogeneous_background_range": [
+          0.0,
+          0.0
+        ],
+        "inhomogeneous_background_sigma_fraction_range": [
+          0.18,
+          0.45
+        ],
+        "low_frequency_noise_range": [
+          0.08,
+          0.3
+        ],
+        "low_frequency_sigma_fraction_range": [
+          0.04,
+          0.12
+        ],
+        "read_noise_std_range": [
+          0.03,
+          0.14
+        ],
+        "total_counts_range": [
+          50.0,
+          25000.0
+        ],
+        "counts_per_pixel_range": null,
+        "blur_sigma_range": [
+          0.3,
+          1.1
+        ],
+        "edge_padding": 24,
+        "normalize_input": true,
+        "clamp_target": true,
+        "min_atoms": 550,
+        "max_atoms": 800,
+        "nearest_neighbor_spacing_range": [
+          14.0,
+          15.2
+        ],
+        "spacing_jitter_fraction_range": [
+          0.03,
+          0.08
+        ],
+        "min_spacing_fraction": 0.86
+      }
+    },
+    "square_lattice": {
+      "class": "PeriodicLatticeConfig",
+      "config": {
+        "image_shape": [
+          512,
+          512
+        ],
+        "sigma_range": [
+          2.8,
+          4.3
+        ],
+        "intensity_range": [
+          0.3,
+          1.0
+        ],
+        "target_sigma": 0.9,
+        "background_range": [
+          0.0,
+          0.3
+        ],
+        "gradient_range": [
+          -0.08,
+          0.08
+        ],
+        "inhomogeneous_background_range": [
+          0.0,
+          0.0
+        ],
+        "inhomogeneous_background_sigma_fraction_range": [
+          0.18,
+          0.45
+        ],
+        "low_frequency_noise_range": [
+          0.08,
+          0.3
+        ],
+        "low_frequency_sigma_fraction_range": [
+          0.04,
+          0.12
+        ],
+        "read_noise_std_range": [
+          0.03,
+          0.14
+        ],
+        "total_counts_range": [
+          50.0,
+          25000.0
+        ],
+        "counts_per_pixel_range": null,
+        "blur_sigma_range": [
+          0.3,
+          1.1
+        ],
+        "edge_padding": 24,
+        "normalize_input": true,
+        "clamp_target": true,
+        "lattice_type": "cubic",
+        "lattice_spacing_range": [
+          12.5,
+          16.7
+        ],
+        "rotation_range": [
+          0.0,
+          180.0
+        ],
+        "jitter_std_range": [
+          0.0,
+          0.25
+        ],
+        "vacancy_fraction_range": [
+          0.0,
+          0.03
+        ],
+        "min_atoms": 400
+      }
+    },
+    "hexagonal_lattice": {
+      "class": "PeriodicLatticeConfig",
+      "config": {
+        "image_shape": [
+          512,
+          512
+        ],
+        "sigma_range": [
+          2.8,
+          4.3
+        ],
+        "intensity_range": [
+          0.3,
+          1.0
+        ],
+        "target_sigma": 0.9,
+        "background_range": [
+          0.0,
+          0.3
+        ],
+        "gradient_range": [
+          -0.08,
+          0.08
+        ],
+        "inhomogeneous_background_range": [
+          0.0,
+          0.0
+        ],
+        "inhomogeneous_background_sigma_fraction_range": [
+          0.18,
+          0.45
+        ],
+        "low_frequency_noise_range": [
+          0.08,
+          0.3
+        ],
+        "low_frequency_sigma_fraction_range": [
+          0.04,
+          0.12
+        ],
+        "read_noise_std_range": [
+          0.03,
+          0.14
+        ],
+        "total_counts_range": [
+          50.0,
+          25000.0
+        ],
+        "counts_per_pixel_range": null,
+        "blur_sigma_range": [
+          0.3,
+          1.1
+        ],
+        "edge_padding": 24,
+        "normalize_input": true,
+        "clamp_target": true,
+        "lattice_type": "hexagonal",
+        "lattice_spacing_range": [
+          12.5,
+          16.7
+        ],
+        "rotation_range": [
+          0.0,
+          180.0
+        ],
+        "jitter_std_range": [
+          0.0,
+          0.25
+        ],
+        "vacancy_fraction_range": [
+          0.0,
+          0.03
+        ],
+        "min_atoms": 400
+      }
+    }
+  }
+}
