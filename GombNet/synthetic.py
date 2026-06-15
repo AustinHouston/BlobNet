@@ -84,6 +84,8 @@ class AseStructureProjectionConfig(ImageFormationConfig):
     position_jitter_std_range: Tuple[float, float] = (0.0, 0.08)
     species_intensity_power: float = 1.6
     repeat_thickness: int = 1
+    merge_projected_columns: bool = False
+    column_merge_tolerance_angstrom: float = 0.08
 
 
 @dataclass(frozen=True)
@@ -624,18 +626,17 @@ def build_ase_structure_unit_cell(structure_name: str):
             cell=[(a, 0.0, 0.0), (0.5 * a, np.sqrt(3.0) * 0.5 * a, 0.0), (0.0, 0.0, 18.0)],
             pbc=(True, True, False),
         )
-    if structure_name == "ws2":
-        a = 3.153
-        return Atoms(
-            "WS2",
-            scaled_positions=[
-                (0.0, 0.0, 0.5),
-                (1.0 / 3.0, 2.0 / 3.0, 0.58),
-                (2.0 / 3.0, 1.0 / 3.0, 0.42),
-            ],
-            cell=[(a, 0.0, 0.0), (0.5 * a, np.sqrt(3.0) * 0.5 * a, 0.0), (0.0, 0.0, 20.0)],
-            pbc=(True, True, False),
-        )
+    if structure_name in {"ws2", "ws2_mx2", "ws2-ase", "ws2_ase"}:
+        try:
+            from ase.build import mx2
+        except ImportError as exc:
+            raise ImportError(
+                "ASE's mx2 builder is required for the WS2 structure."
+            ) from exc
+        atoms = mx2("WS2")
+        atoms.cell[2, 2] = 20.0
+        atoms.pbc = (True, True, False)
+        return atoms
     if structure_name in {"sto", "srtio3"}:
         a = 3.905
         return Atoms(
@@ -650,7 +651,42 @@ def build_ase_structure_unit_cell(structure_name: str):
             cell=[(a, 0.0, 0.0), (0.0, a, 0.0), (0.0, 0.0, a)],
             pbc=(True, True, True),
         )
-    raise ValueError("Unsupported ASE structure. Expected graphene, ws2, or sto.")
+    raise ValueError("Unsupported ASE structure. Expected graphene, ws2, ws2_mx2, or sto.")
+
+
+def _merge_projected_columns(
+    xy: np.ndarray,
+    atomic_numbers: np.ndarray,
+    symbols: np.ndarray,
+    *,
+    species_intensity_power: float,
+    tolerance_angstrom: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    tolerance = max(float(tolerance_angstrom), 1e-6)
+    keys = np.round(np.asarray(xy, dtype=np.float32) / tolerance).astype(np.int64)
+    groups: Dict[tuple[int, int], List[int]] = {}
+    for index, key in enumerate(keys):
+        groups.setdefault((int(key[0]), int(key[1])), []).append(index)
+
+    merged_xy = []
+    merged_numbers = []
+    merged_symbols = []
+    merged_weights = []
+    weights = atomic_numbers.astype(np.float32) ** float(species_intensity_power)
+    for indices in groups.values():
+        index_array = np.asarray(indices, dtype=np.int64)
+        group_weights = weights[index_array]
+        merged_xy.append(np.average(xy[index_array], axis=0, weights=group_weights))
+        merged_numbers.append(int(np.max(atomic_numbers[index_array])))
+        merged_symbols.append("/".join(sorted(set(symbols[index_array].tolist()))))
+        merged_weights.append(float(np.sum(group_weights)))
+
+    return (
+        np.asarray(merged_xy, dtype=np.float32),
+        np.asarray(merged_numbers, dtype=np.int32),
+        np.asarray(merged_symbols),
+        np.asarray(merged_weights, dtype=np.float32),
+    )
 
 
 def sample_structure_points(
@@ -680,6 +716,17 @@ def sample_structure_points(
 
     theta = _sample_scalar(rng, config.rotation_range)
     xy = positions[:, :2] @ _rotation_matrix_xy(theta).T
+    if config.merge_projected_columns:
+        xy, atomic_numbers, symbols, z_weight = _merge_projected_columns(
+            xy,
+            atomic_numbers,
+            symbols,
+            species_intensity_power=config.species_intensity_power,
+            tolerance_angstrom=config.column_merge_tolerance_angstrom,
+        )
+    else:
+        z_weight = atomic_numbers.astype(np.float32) ** float(config.species_intensity_power)
+
     jitter_std = _sample_scalar(rng, config.position_jitter_std_range)
     if jitter_std > 0:
         xy = xy + rng.normal(0.0, jitter_std, size=xy.shape).astype(np.float32)
@@ -700,11 +747,11 @@ def sample_structure_points(
     coordinates = _shift_coordinates(render_coordinates[keep], (-padding, -padding))
     atomic_numbers = atomic_numbers[keep]
     symbols = symbols[keep]
+    z_weight = z_weight[keep]
     visible = _in_frame_mask(coordinates, config.image_shape)
     if int(visible.sum()) == 0:
         raise RuntimeError(f"{config.structure_name} projection produced no in-frame atoms.")
 
-    z_weight = atomic_numbers.astype(np.float32) ** float(config.species_intensity_power)
     z_min, z_max = float(z_weight.min()), float(z_weight.max())
     normalized = np.full_like(z_weight, 0.5) if z_max <= z_min else (z_weight - z_min) / (z_max - z_min)
     low, high = config.intensity_range

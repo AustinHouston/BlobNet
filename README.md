@@ -40,6 +40,12 @@ uv run python training_scripts/check_mps.py
 - `training_scripts/run_dataset_study.py`
   Trains separate U-Nets on random, tight-spacing random, square-lattice, and hexagonal-lattice datasets, then compares every train/test pairing.
 
+- `training_scripts/compare_pretrained_models.py`
+  Compares Blob-Net with pretrained AtomSegNet and AtomAI models on the same synthetic images, sweeps detection thresholds, ranks the models, and can test the best models on TEM-ImageNet v1.3.
+
+- `training_scripts/sweep_blobnet_pixel_size.py`
+  Tests a trained Blob-Net checkpoint across generated datasets rendered at different pixel sizes, plotting accuracy against pixel size and feature size relative to the bottleneck receptive field.
+
 - `training_scripts/analyze_real_image.py`
   Detects and fits blobs in a real EMD image to estimate realistic sigma and spacing priors.
 
@@ -114,6 +120,31 @@ uv run python training_scripts/run_dataset_study.py \
   --device auto
 ```
 
+Compare Blob-Net with external pretrained atom-localization models:
+
+```bash
+source .venv/bin/activate
+uv run python training_scripts/compare_pretrained_models.py \
+  --output-dir /tmp/blobnet_pretrained_compare \
+  --download-models \
+  --download-tem-imagenet \
+  --tem-imagenet-max-samples 128 \
+  --device auto
+```
+
+AtomAI is optional and must be installed separately for its pretrained models to run. Without `--download-models`, the comparison uses cached external weights if present and reports skipped models in `model_status.json`. The ImageNet option targets the AtomSegNet paper's TEM-ImageNet v1.3 dataset, available from `xinhuolin/TEM-ImageNet-v1.3`, rather than the natural-image ILSVRC ImageNet dataset.
+
+Sweep Blob-Net across pixel sizes around the training pixel size:
+
+```bash
+source .venv/bin/activate
+uv run python training_scripts/sweep_blobnet_pixel_size.py \
+  --output-dir /tmp/blobnet_pixel_size_sweep \
+  --samples-per-size 64 \
+  --dataset random \
+  --device auto
+```
+
 Analyze the real image to estimate sigma and spacing:
 
 ```bash
@@ -140,6 +171,20 @@ A dataset study run writes:
 - `model_output_series/*.png` comparisons showing the same held-out images through each trained model
 - one best checkpoint per training dataset
 
+A pretrained-model comparison run writes:
+- `synthetic_metrics_by_threshold.json/csv`
+- `synthetic_best_metrics.json/csv` and `model_ranking.json/csv`
+- `threshold_ranking.json/csv`
+- `model_status.json/csv`
+- `synthetic_generalization_summary.png` and `synthetic_prediction_gallery.png`
+- `tem_imagenet_metrics.json/csv` when TEM-ImageNet is available or downloaded
+
+A pixel-size sweep writes:
+- `pixel_size_metrics.json/csv`
+- `pixel_size_sweep_config.json`
+- `pixel_size_accuracy_vs_feature_rf.png`
+- `pixel_size_target_output_examples.png`
+
 ## Project Layout
 
 ```text
@@ -155,6 +200,8 @@ GombNet/
 training_scripts/
   train_unet.py
   run_dataset_study.py
+  compare_pretrained_models.py
+  sweep_blobnet_pixel_size.py
   generate_dataset.py
   export_examples.py
   export_low_count_demo.py

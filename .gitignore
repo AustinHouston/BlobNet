@@ -7,6 +7,9 @@ dist/
 .venv/
 .venv-gpu-test/
 examples/
+outputs/
+dataset_study_10epoch/
+real_data/ims_from_elizabeth/
 *.npz
 *.pth
 *.png
