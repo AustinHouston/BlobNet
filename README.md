@@ -1,13 +1,11 @@
-# Blob-Net
+# BlobNet
 
-Blob-Net trains one U-Net for atom localization in atomic-resolution STEM images.
+BlobNet is a focused U-Net pipeline for atom localization in atomic-resolution STEM images.
 
-The repo has one supported training workflow:
-- generate synthetic microscope-image batches in memory
-- train the U-Net on random atom-like peaks
-- evaluate the same checkpoint on random, cubic, hexagonal, and ASE-projected structures
-- run tiled inference on one real EMD image
-- write metrics, plots, galleries, and the best checkpoint
+The maintained workflow has two explicit steps:
+
+1. Generate deterministic train, validation, and test datasets from YAML.
+2. Train U-Net from the saved dataset and write checkpoints, losses, and metrics.
 
 ## Environment
 
@@ -15,68 +13,86 @@ The repo has one supported training workflow:
 uv sync
 ```
 
-On Apple Silicon, verify MPS before a long run:
+## Generate A Dataset
+
+Dataset parameters live in `configs/dataset_configs/`. The default configuration generates random microscope images:
 
 ```bash
-uv run python training_scripts/check_mps.py
+uv run blobnet-generate-dataset \
+  --config configs/dataset_configs/random_microscope.yaml
 ```
 
-## Train
+Useful overrides:
 
 ```bash
-uv run python training_scripts/train_unet.py \
-  --output-dir /tmp/blobnet_run \
+uv run blobnet-generate-dataset \
+  --config configs/dataset_configs/random_microscope.yaml \
+  --output-dir /tmp/blobnet_dataset \
+  --train-samples 128 \
+  --val-samples 32 \
+  --test-samples 32
+```
+
+The generator writes one compressed NPZ file per sample under `train/`, `val/`, and `test/`, plus `dataset_manifest.yaml` with the resolved generation parameters.
+
+## Train U-Net
+
+Model and training parameters live in `configs/model_configs/`:
+
+```bash
+uv run blobnet-train \
+  --config configs/model_configs/unet.yaml
+```
+
+Common settings can be overridden without editing YAML:
+
+```bash
+uv run blobnet-train \
+  --config configs/model_configs/unet.yaml \
+  --dataset-dir /tmp/blobnet_dataset \
+  --output-dir /tmp/blobnet_training \
+  --epochs 10 \
+  --batch-size 4 \
+  --learning-rate 0.001 \
   --device auto
 ```
 
-The same command is also installed as:
+Training writes:
 
-```bash
-uv run blobnet-train-unet --output-dir /tmp/blobnet_run --device auto
+- `unet_best.pth`
+- `unet_loss_history.npz`
+- `loss_history.csv`
+- `loss_curves.png`
+- `training_metrics.json`
+- `resolved_config.yaml`
+
+## Experimental Images
+
+`notebooks/emd_reader.ipynb` is a self-contained pyTEMlib notebook for loading and plotting every EMD file in `experimental_data/`.
+
+## Python API
+
+```python
+from blobnet import RandomMicroscopeImageConfig, generate_microscope_image
+
+config = RandomMicroscopeImageConfig(image_shape=(256, 256))
+sample = generate_microscope_image(config)
+image, target = sample['image'], sample['target']
 ```
-
-Useful smoke-test settings:
-
-```bash
-uv run python training_scripts/train_unet.py \
-  --output-dir /tmp/blobnet_smoke \
-  --epochs 1 \
-  --batch-size 1 \
-  --train-samples 4 \
-  --val-samples 2 \
-  --random-test-samples 1 \
-  --periodic-test-samples 1 \
-  --structure-test-samples 1 \
-  --height 96 \
-  --width 96 \
-  --structure-height 96 \
-  --structure-width 96 \
-  --num-workers 0 \
-  --device auto
-```
-
-## Outputs
-
-A run writes:
-- `benchmark_metrics.json` and `benchmark_metrics.csv`
-- summary plots for random, periodic, and structure tests
-- prediction galleries and offset clouds
-- `real_image/` inference plots for the configured EMD file
-- `unet/unet_best.pth`
 
 ## Layout
 
 ```text
-GombNet/
-  synthetic.py        synthetic data generation
-  networks.py         U-Net model
-  loss_func.py        heatmap regression loss
-  metrics.py          localization metrics
-  real_image.py       EMD loading and tiled inference helpers
-  visualization.py    plotting and gallery helpers
-  utils.py            device resolution and training loop
-
-training_scripts/
-  train_unet.py       main workflow
-  check_mps.py        Apple Silicon device check
+blobnet/                     reusable models, data generation, metrics, and plotting
+configs/
+  dataset_configs/           saved-dataset generation parameters
+  model_configs/             model, loss, and training parameters
+scripts/
+  generate_training_dataset.py
+  train_unet.py
+  check_mps.py
+notebooks/                   dataset and experimental-image exploration
+experimental_data/           tracked EMD examples
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions.
