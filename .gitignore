@@ -7,7 +7,6 @@ dist/
 .venv/
 examples/
 outputs/
-experimental_data/
 *.npz
 *.pth
 *.png
