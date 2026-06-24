@@ -11,29 +11,15 @@ requires-python = ">=3.10"
 dependencies = [
     "ase>=3.23",
     "h5py>=3.10",
-    "ipykernel>=6.29",
-    "jupyterlab>=4.2",
     "matplotlib>=3.7",
-    "notebook>=7.2",
     "numpy>=1.24",
     "pillow>=9.4",
     "scipy>=1.11",
     "torch>=2.1",
-    "torchvision>=0.16",
 ]
 
 [project.scripts]
 blobnet-train-unet = "training_scripts.train_unet:main"
-blobnet-generate-dataset = "training_scripts.generate_dataset:main"
-blobnet-export-examples = "training_scripts.export_examples:main"
-blobnet-export-low-count-demo = "training_scripts.export_low_count_demo:main"
-blobnet-analyze-real-image = "training_scripts.analyze_real_image:main"
-blobnet-run-dataset-study = "training_scripts.run_dataset_study:main"
-blobnet-compare-pretrained-models = "training_scripts.compare_pretrained_models:main"
-blobnet-sweep-pixel-size = "training_scripts.sweep_blobnet_pixel_size:main"
-blobnet-run-emd-folder = "training_scripts.run_blobnet_on_emd_folder:main"
-blobnet-export-material-examples = "training_scripts.export_material_dataset_examples:main"
-blobnet-run-material-dataset-study = "training_scripts.run_material_dataset_study:main"
 
 [tool.setuptools]
 packages = ["GombNet", "training_scripts"]
