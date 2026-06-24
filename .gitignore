@@ -5,8 +5,9 @@ __pycache__/
 build/
 dist/
 .venv/
-.venv-gpu-test/
 examples/
+outputs/
+experimental_data/
 *.npz
 *.pth
 *.png

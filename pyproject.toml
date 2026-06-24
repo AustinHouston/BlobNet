@@ -3,7 +3,7 @@ requires = ["setuptools>=58", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "blob-net"
+name = "blobnet"
 version = "0.1.0"
 description = "Edge-aware synthetic-data generation, U-Net training, and visualization tools for atom localization in atomic-resolution STEM images."
 readme = "README.md"
@@ -17,18 +17,16 @@ dependencies = [
     "notebook>=7.2",
     "numpy>=1.24",
     "pillow>=9.4",
+    "pytemlib>=0.2026.6.0",
+    "pyyaml>=6.0",
     "scipy>=1.11",
     "torch>=2.1",
     "torchvision>=0.16",
 ]
 
 [project.scripts]
-blobnet-train-unet = "training_scripts.train_unet:main"
-blobnet-generate-dataset = "training_scripts.generate_dataset:main"
-blobnet-export-examples = "training_scripts.export_examples:main"
-blobnet-export-low-count-demo = "training_scripts.export_low_count_demo:main"
-blobnet-analyze-real-image = "training_scripts.analyze_real_image:main"
-blobnet-run-dataset-study = "training_scripts.run_dataset_study:main"
+blobnet-generate-dataset = "scripts.generate_training_dataset:main"
+blobnet-train = "scripts.train_unet:main"
 
 [tool.setuptools]
-packages = ["GombNet", "training_scripts"]
+packages = ["blobnet", "scripts"]
