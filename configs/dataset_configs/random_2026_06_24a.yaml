@@ -1,7 +1,7 @@
 dataset:
-  name: random_microscope_v1
+  name: random_2026_06_24a
   type: random
-  output_dir: outputs/datasets/random_microscope_v1
+  output_dir: outputs/datasets/random_2026_06_24a
   seed: 0
   prefix: sample
   splits:

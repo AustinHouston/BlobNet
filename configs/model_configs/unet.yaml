@@ -1,5 +1,5 @@
 dataset:
-  path: outputs/datasets/random_microscope_v1
+  path: outputs/datasets/random_2026_06_24a
 
 model:
   input_channels: 1

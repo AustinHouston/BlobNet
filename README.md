@@ -17,16 +17,20 @@ uv sync
 
 Dataset parameters live in `configs/dataset_configs/`. The default configuration generates random microscope images:
 
+- `random_2026_06_24a.yaml`
+- `square_2026_06_24a.yaml`
+- `hexagonal_2026_06_24a.yaml`
+
 ```bash
 uv run blobnet-generate-dataset \
-  --config configs/dataset_configs/random_microscope.yaml
+  --config configs/dataset_configs/random_2026_06_24a.yaml
 ```
 
 Useful overrides:
 
 ```bash
 uv run blobnet-generate-dataset \
-  --config configs/dataset_configs/random_microscope.yaml \
+  --config configs/dataset_configs/random_2026_06_24a.yaml \
   --output-dir /tmp/blobnet_dataset \
   --train-samples 128 \
   --val-samples 32 \

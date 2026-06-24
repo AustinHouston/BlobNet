@@ -25,7 +25,7 @@ CONFIG_TYPES = {
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Generate and save a BlobNet training dataset from YAML.')
-    parser.add_argument('--config', type=Path, default=Path('configs/dataset_configs/random_microscope.yaml'))
+    parser.add_argument('--config', type=Path, default=Path('configs/dataset_configs/random_2026_06_24a.yaml'))
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--train-samples', type=int)
     parser.add_argument('--val-samples', type=int)

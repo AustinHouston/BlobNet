@@ -33,8 +33,6 @@ from blobnet.synthetic import (
     save_microscope_dataset_splits,
     save_microscope_preview,
 )
-from blobnet.utils import resolve_torch_device, train_model
-
 __all__ = [
     "AseStructureProjectionConfig",
     "CombinedGaussianLoss",
@@ -62,7 +60,6 @@ __all__ = [
     "plot_localization_result",
     "point_cloud_from_config",
     "render_microscope_image",
-    "resolve_torch_device",
     "sample_lattice_points",
     "sample_random_points",
     "sample_structure_points",
@@ -70,5 +67,4 @@ __all__ = [
     "save_microscope_dataset",
     "save_microscope_dataset_splits",
     "save_microscope_preview",
-    "train_model",
 ]
