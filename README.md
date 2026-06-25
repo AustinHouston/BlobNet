@@ -13,6 +13,25 @@ The maintained workflow has two explicit steps:
 uv sync
 ```
 
+On Windows or Linux with an NVIDIA GPU, BlobNet uses the CUDA 12.8 PyTorch wheel index through `pyproject.toml`. Refresh the lockfile and environment after pulling changes:
+
+```bash
+uv lock
+uv sync
+```
+
+Check that the `uv` environment can see CUDA before starting a long training run:
+
+```bash
+uv run python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.device_count()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda device')"
+```
+
+If CUDA is still unavailable, confirm that the NVIDIA driver is visible outside Python:
+
+```bash
+nvidia-smi
+```
+
 ## Generate A Dataset
 
 Dataset parameters live in `configs/dataset_configs/`. The default configuration generates random atom images:

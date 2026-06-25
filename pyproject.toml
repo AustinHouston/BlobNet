@@ -30,5 +30,18 @@ blobnet-train = "scripts.train_unet:main"
 blobnet-manuscript-figures = "scripts.make_manuscript_figures:main"
 blobnet-train-manuscript = "scripts.train_manuscript_models:main"
 
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.setuptools]
 packages = ["blobnet", "scripts"]
