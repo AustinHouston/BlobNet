@@ -20,6 +20,42 @@ from blobnet.networks import build_unet
 from blobnet.synthetic import SavedAtomImageDataset
 
 
+def resolve_training_device(device_name: str) -> torch.device:
+    if device_name == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                'Requested --device cuda, but torch.cuda.is_available() is false. '
+                'Check that this uv environment has a CUDA-enabled PyTorch build and that the GPU is visible.'
+            )
+        return torch.device('cuda')
+    if device_name == 'mps':
+        if not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+            raise RuntimeError('Requested --device mps, but MPS is not available.')
+        return torch.device('mps')
+    if device_name == 'cpu':
+        return torch.device('cpu')
+    if device_name != 'auto':
+        raise ValueError(f'Unsupported device {device_name!r}.')
+
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def print_device_report(device: torch.device, requested_device: str) -> None:
+    print(f'Requested device: {requested_device}', flush=True)
+    print(f'Using device: {device}', flush=True)
+    print(f'torch: {torch.__version__}', flush=True)
+    print(f'cuda available: {torch.cuda.is_available()}', flush=True)
+    print(f'cuda device count: {torch.cuda.device_count()}', flush=True)
+    if torch.cuda.is_available():
+        print(f'cuda device 0: {torch.cuda.get_device_name(0)}', flush=True)
+    if hasattr(torch.backends, 'mps'):
+        print(f'mps available: {torch.backends.mps.is_available()}', flush=True)
+
+
 def train_model(
     model: torch.nn.Module,
     train_loader,
@@ -174,15 +210,8 @@ def main() -> int:
 
     torch.manual_seed(seed)
     np.random.seed(seed)
-    if device_name != 'auto':
-        device = torch.device(device_name)
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
-    print(f'Using device: {device}', flush=True)
+    device = resolve_training_device(device_name)
+    print_device_report(device, device_name)
     datasets = {split: SavedAtomImageDataset(dataset_dir / split) for split in ('train', 'val', 'test')}
     loaders = {
         split: DataLoader(

@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 
 DATASET_CONFIGS = {
     'random': Path('configs/dataset_configs/random.yaml'),
@@ -31,26 +33,69 @@ def run_command(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def read_dataset_plan(config_path: Path) -> tuple[Path, dict[str, int]]:
+    config = yaml.safe_load(config_path.read_text())
+    dataset_settings = config['dataset']
+    split_settings = dataset_settings['splits']
+    output_dir = Path(dataset_settings['output_dir'])
+    expected_counts = {split: int(count) for split, count in split_settings.items()}
+    return output_dir, expected_counts
+
+
+def count_dataset_samples(output_dir: Path, expected_counts: dict[str, int]) -> dict[str, int]:
+    return {split: len(list((output_dir / split).glob('*.npz'))) for split in expected_counts}
+
+
+def format_counts(counts: dict[str, int]) -> str:
+    return ', '.join(f'{split}={count}' for split, count in counts.items())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Generate manuscript datasets, train U-Nets, and rebuild figures.')
-    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda', 'mps'], default='auto')
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda', 'mps'], default='cuda')
     parser.add_argument('--output-dir', type=Path, default=Path('outputs/manuscript_figures'))
     parser.add_argument('--epochs', type=int, help='Override epochs for every model config.')
     parser.add_argument('--batch-size', type=int, help='Override batch size for every model config.')
     parser.add_argument('--dataset-workers', type=int, default=0, help='Parallel workers for dataset generation. Use 0 for all available CPUs.')
+    parser.add_argument('--skip-dataset-generation', action='store_true', help='Start at training and leave dataset directories untouched.')
+    parser.add_argument('--regenerate-datasets', action='store_true', help='Overwrite and rebuild datasets before training.')
     parser.add_argument('--skip-figures', action='store_true')
     args = parser.parse_args()
+    if args.skip_dataset_generation and args.regenerate_datasets:
+        parser.error('--skip-dataset-generation and --regenerate-datasets cannot be used together.')
 
-    for name, config_path in DATASET_CONFIGS.items():
-        run_command([
-            sys.executable,
-            'scripts/generate_training_dataset.py',
-            '--config',
-            str(config_path),
-            '--overwrite',
-            '--num-workers',
-            str(args.dataset_workers),
-        ])
+    if args.skip_dataset_generation:
+        print('\nSkipping dataset generation; training will use dataset paths from the model configs.', flush=True)
+    else:
+        for name, config_path in DATASET_CONFIGS.items():
+            dataset_dir, expected_counts = read_dataset_plan(config_path)
+            actual_counts = count_dataset_samples(dataset_dir, expected_counts)
+            if not args.regenerate_datasets and actual_counts == expected_counts:
+                print(
+                    f'\n{name}: using existing dataset at {dataset_dir} '
+                    f'({format_counts(actual_counts)})',
+                    flush=True,
+                )
+                continue
+            if not args.regenerate_datasets and any(actual_counts.values()):
+                raise FileExistsError(
+                    f'{name}: found a partial or mismatched dataset at {dataset_dir}. '
+                    f'Expected {format_counts(expected_counts)}, found {format_counts(actual_counts)}. '
+                    'Pass --regenerate-datasets to overwrite and rebuild it, or pass '
+                    '--skip-dataset-generation to start training from the model-config dataset paths.'
+                )
+
+            command = [
+                sys.executable,
+                'scripts/generate_training_dataset.py',
+                '--config',
+                str(config_path),
+                '--num-workers',
+                str(args.dataset_workers),
+            ]
+            if args.regenerate_datasets:
+                command.append('--overwrite')
+            run_command(command)
 
     for name, config_path in MODEL_CONFIGS.items():
         command = [

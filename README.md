@@ -80,14 +80,28 @@ The manuscript comparison uses three matched U-Net configs:
 - `configs/model_configs/square_unet.yaml`
 - `configs/model_configs/hexagonal_unet.yaml`
 
-Run the full pipeline from regenerated datasets to trained models and figures:
+Run the full pipeline from existing datasets to trained models and figures:
 
 ```bash
-uv run blobnet-train-manuscript --device auto
+uv run blobnet-train-manuscript --device cuda
 ```
 
-This command regenerates the random, square, and hexagonal datasets with `--overwrite`, trains all three U-Nets from scratch, checks that each checkpoint was written, and rebuilds the manuscript figures.
-Dataset generation runs in parallel by default; use `--dataset-workers N` to cap it.
+This command reuses complete random, square, and hexagonal datasets when they already match the config split counts, trains all three U-Nets from scratch, checks that each checkpoint was written, and rebuilds the manuscript figures.
+If a dataset is missing, the script generates it. If a dataset is partial or has mismatched split counts, the script stops instead of silently mixing old and new data.
+
+Start from training when the datasets are already generated and should not be touched:
+
+```bash
+uv run blobnet-train-manuscript --device cuda --skip-dataset-generation
+```
+
+Regenerate every dataset before training when you need fresh data:
+
+```bash
+uv run blobnet-train-manuscript --device cuda --regenerate-datasets
+```
+
+Dataset generation runs in parallel by default when it is needed; use `--dataset-workers N` to cap it.
 
 ## Experimental Images
 
