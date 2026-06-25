@@ -332,12 +332,12 @@ def make_figure_1(args: argparse.Namespace) -> Path:
     fig = plt.figure(figsize=(19, 8.8))
     grid = fig.add_gridspec(
         3,
-        7,
+        8,
         left=0.035,
         right=0.99,
         top=0.875,
         bottom=0.075,
-        wspace=0.18,
+        wspace=0.17,
         hspace=0.28,
     )
     fig.suptitle('Training Geometry Controls Synthetic Generalization', fontsize=16)
@@ -345,10 +345,12 @@ def make_figure_1(args: argparse.Namespace) -> Path:
     for row, dataset in enumerate(datasets):
         ax = fig.add_subplot(grid[row, 0])
         _plot_clean_image(ax, examples[dataset.key]['image'], f'{dataset.label} training example')
+        ax = fig.add_subplot(grid[row, 1])
+        _plot_clean_image(ax, examples[dataset.key]['target'], f'{dataset.label} ground truth', cmap='magma')
 
     for row, dataset in enumerate(datasets):
         for col, model_spec in enumerate(models):
-            ax = fig.add_subplot(grid[row, col + 1])
+            ax = fig.add_subplot(grid[row, col + 2])
             if row == 0:
                 ax.set_title(model_spec.label, fontsize=11)
             prediction = predictions.get((model_spec.key, dataset.key))
@@ -364,7 +366,7 @@ def make_figure_1(args: argparse.Namespace) -> Path:
                 _annotate_probability_metric(ax, offset_results.get((model_spec.key, dataset.key)))
 
         for col, model_spec in enumerate(models):
-            ax = fig.add_subplot(grid[row, col + 4])
+            ax = fig.add_subplot(grid[row, col + 5])
             if row == 0:
                 ax.set_title(f'{model_spec.label} offsets', fontsize=11)
             result = offset_results.get((model_spec.key, dataset.key))
@@ -414,9 +416,9 @@ def make_figure_1(args: argparse.Namespace) -> Path:
                 fontsize=7,
             )
 
-    fig.text(0.105, 0.915, 'Representative synthetic training images', ha='center', fontsize=11)
-    fig.text(0.455, 0.915, 'Raw model probability maps', ha='center', fontsize=11)
-    fig.text(0.795, 0.915, 'Matched localization offset clouds', ha='center', fontsize=11)
+    fig.text(0.135, 0.915, 'Representative synthetic training images and targets', ha='center', fontsize=11)
+    fig.text(0.475, 0.915, 'Raw model probability maps', ha='center', fontsize=11)
+    fig.text(0.81, 0.915, 'Matched localization offset clouds', ha='center', fontsize=11)
     output_path = output_dir / 'figure1_training_geometry_generalization.png'
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)

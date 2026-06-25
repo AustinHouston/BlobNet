@@ -233,65 +233,75 @@ def _image_settings_from(config: ImageFormationConfig) -> Dict[str, Any]:
     return {name: getattr(config, name) for name in fields}
 
 
-_OFFSET_CACHE: Dict[Tuple[float, float], np.ndarray] = {}
-
-
-def _offsets_between_radii(min_radius: float, max_radius: float) -> np.ndarray:
-    min_radius = max(0.0, float(min_radius))
-    max_radius = max(min_radius, float(max_radius))
-    key = (round(min_radius, 4), round(max_radius, 4))
-    cached = _OFFSET_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    radius_px = int(np.ceil(max_radius))
-    yy, xx = np.mgrid[-radius_px : radius_px + 1, -radius_px : radius_px + 1]
-    squared = yy.astype(np.float32) ** 2 + xx.astype(np.float32) ** 2
-    mask = (squared >= min_radius**2) & (squared <= max_radius**2)
-    offsets = np.stack([yy[mask], xx[mask]], axis=1).astype(np.int32)
-    _OFFSET_CACHE[key] = offsets
-    return offsets
-
-
-def _valid_pixel_mask(
+def _valid_sampling_bounds(
     shape: Tuple[int, int],
     boundary_margin: float,
-) -> np.ndarray:
+) -> tuple[float, float, float, float]:
     height, width = int(shape[0]), int(shape[1])
-    y0 = int(np.ceil(max(0.0, float(boundary_margin))))
-    x0 = int(np.ceil(max(0.0, float(boundary_margin))))
-    y1 = int(np.ceil(min(float(height), float(height) - float(boundary_margin))))
-    x1 = int(np.ceil(min(float(width), float(width) - float(boundary_margin))))
-    mask = np.zeros((height, width), dtype=bool)
-    if y1 > y0 and x1 > x0:
-        mask[y0:y1, x0:x1] = True
-    return mask
+    margin = max(0.0, float(boundary_margin))
+    y_min = margin
+    x_min = margin
+    y_max = float(height) - margin
+    x_max = float(width) - margin
+    if y_max <= y_min or x_max <= x_min:
+        raise RuntimeError(
+            f'No valid random-atom sampling area for shape={shape} and margin={margin:.3f}.'
+        )
+    return y_min, y_max, x_min, x_max
 
 
-def _sample_coordinate_from_mask(
-    mask: np.ndarray,
-    rng: np.random.Generator,
-) -> Optional[np.ndarray]:
-    choices = np.flatnonzero(mask.ravel())
-    if len(choices) == 0:
-        return None
-    flat_index = int(choices[int(rng.integers(0, len(choices)))])
-    y, x = np.unravel_index(flat_index, mask.shape)
-    return np.array([float(y), float(x)], dtype=np.float32)
+def _grid_index_for_coordinate(
+    coordinate: np.ndarray,
+    y_min: float,
+    x_min: float,
+    cell_size: float,
+) -> tuple[int, int]:
+    row = int((float(coordinate[0]) - y_min) / cell_size)
+    col = int((float(coordinate[1]) - x_min) / cell_size)
+    return row, col
 
 
-def _paint_offsets(
-    mask: np.ndarray,
-    center_yx: np.ndarray,
-    offsets_yx: np.ndarray,
-    value: bool,
+def _is_poisson_candidate_valid(
+    candidate: np.ndarray,
+    coordinates: list[np.ndarray],
+    grid: np.ndarray,
+    y_min: float,
+    x_min: float,
+    cell_size: float,
+    min_separation: float,
+) -> bool:
+    row, col = _grid_index_for_coordinate(candidate, y_min, x_min, cell_size)
+    if row < 0 or row >= grid.shape[0] or col < 0 or col >= grid.shape[1]:
+        return False
+
+    row0 = max(0, row - 2)
+    row1 = min(grid.shape[0], row + 3)
+    col0 = max(0, col - 2)
+    col1 = min(grid.shape[1], col + 3)
+    min_squared = float(min_separation) ** 2
+
+    for nearby_index in grid[row0:row1, col0:col1].ravel():
+        if nearby_index < 0:
+            continue
+        delta = candidate - coordinates[int(nearby_index)]
+        if float(delta @ delta) < min_squared:
+            return False
+    return True
+
+
+def _store_poisson_coordinate(
+    coordinate: np.ndarray,
+    coordinates: list[np.ndarray],
+    active_indices: list[int],
+    grid: np.ndarray,
+    y_min: float,
+    x_min: float,
+    cell_size: float,
 ) -> None:
-    center_y = int(round(float(center_yx[0])))
-    center_x = int(round(float(center_yx[1])))
-    ys = center_y + offsets_yx[:, 0]
-    xs = center_x + offsets_yx[:, 1]
-    keep = (ys >= 0) & (ys < mask.shape[0]) & (xs >= 0) & (xs < mask.shape[1])
-    mask[ys[keep], xs[keep]] = value
+    coordinates.append(coordinate.astype(np.float32))
+    active_indices.append(len(coordinates) - 1)
+    row, col = _grid_index_for_coordinate(coordinate, y_min, x_min, cell_size)
+    grid[row, col] = len(coordinates) - 1
 
 
 def sample_atom_coordinates(
@@ -301,7 +311,7 @@ def sample_atom_coordinates(
     min_separation: Optional[float] = None,
     boundary_margin: Optional[float] = None,
 ) -> np.ndarray:
-    """Sample random atom centers with a minimum separation."""
+    """Sample random atom centers with Bridson Poisson-disk sampling."""
 
     rng = _as_rng(rng)
     height, width = config.image_shape
@@ -321,22 +331,58 @@ def sample_atom_coordinates(
         else max(min_separation, _support_margin_for_sigma(config.sigma_range))
     )
 
-    coordinates = np.empty((atom_count, 2), dtype=np.float32)
-    accepted = 0
-    valid = _valid_pixel_mask((height, width), margin)
-    exclusion_offsets = _offsets_between_radii(0.0, min_separation)
+    y_min, y_max, x_min, x_max = _valid_sampling_bounds((height, width), margin)
+    cell_size = max(float(min_separation) / np.sqrt(2.0), 1e-6)
+    grid_shape = (
+        max(1, int(np.ceil((y_max - y_min) / cell_size))),
+        max(1, int(np.ceil((x_max - x_min) / cell_size))),
+    )
+    grid = np.full(grid_shape, -1, dtype=np.int32)
+    coordinates: list[np.ndarray] = []
+    active_indices: list[int] = []
+    first = np.array(
+        [
+            rng.uniform(y_min, y_max),
+            rng.uniform(x_min, x_max),
+        ],
+        dtype=np.float32,
+    )
+    _store_poisson_coordinate(first, coordinates, active_indices, grid, y_min, x_min, cell_size)
 
-    for _ in range(atom_count):
-        candidate = _sample_coordinate_from_mask(valid, rng)
-        if candidate is None:
-            break
-        coordinates[accepted] = candidate
-        _paint_offsets(valid, candidate, exclusion_offsets, False)
-        accepted += 1
+    candidates_per_active_point = 30
+    while active_indices and len(coordinates) < atom_count:
+        active_list_index = int(rng.integers(0, len(active_indices)))
+        source = coordinates[active_indices[active_list_index]]
+        accepted = False
+        angles = rng.uniform(0.0, 2.0 * np.pi, size=candidates_per_active_point)
+        radii = min_separation * np.sqrt(rng.uniform(1.0, 4.0, size=candidates_per_active_point))
+        for angle, radius in zip(angles, radii):
+            candidate = source + np.array(
+                [radius * np.sin(angle), radius * np.cos(angle)],
+                dtype=np.float32,
+            )
+            if not (y_min <= float(candidate[0]) < y_max and x_min <= float(candidate[1]) < x_max):
+                continue
+            if not _is_poisson_candidate_valid(
+                candidate,
+                coordinates,
+                grid,
+                y_min,
+                x_min,
+                cell_size,
+                min_separation,
+            ):
+                continue
+            _store_poisson_coordinate(candidate, coordinates, active_indices, grid, y_min, x_min, cell_size)
+            accepted = True
+            if len(coordinates) >= atom_count:
+                break
+        if not accepted:
+            active_indices.pop(active_list_index)
 
-    if accepted == 0:
+    if not coordinates:
         raise RuntimeError("Failed to sample any atom coordinates.")
-    return coordinates[:accepted].copy()
+    return np.stack(coordinates, axis=0).astype(np.float32)
 
 
 def sample_random_atom_points(
@@ -356,13 +402,7 @@ def sample_random_atom_points(
         coordinates = sample_atom_coordinates(
             config, rng, atom_count=desired_visible_count, min_separation=min_separation
         )
-        subpixel_jitter = _sample_scalar(rng, config.subpixel_jitter_range)
-        if subpixel_jitter > 0:
-            coordinates = coordinates + rng.uniform(
-                -subpixel_jitter,
-                subpixel_jitter,
-                size=coordinates.shape,
-            ).astype(np.float32)
+        subpixel_jitter = 0.0
         target_coordinates = coordinates
     else:
         expanded_shape = _expanded_shape(config.image_shape, padding)
@@ -381,7 +421,7 @@ def sample_random_atom_points(
         best_score: Optional[Tuple[int, int]] = None
         best_subpixel_jitter = 0.0
 
-        for _ in range(24):
+        for _ in range(2):
             padded = sample_atom_coordinates(
                 sampling_config,
                 rng,
@@ -390,13 +430,7 @@ def sample_random_atom_points(
                 boundary_margin=boundary_margin,
             )
             coordinates = _shift_coordinates(padded, (-padding, -padding))
-            subpixel_jitter = _sample_scalar(rng, config.subpixel_jitter_range)
-            if subpixel_jitter > 0:
-                coordinates = coordinates + rng.uniform(
-                    -subpixel_jitter,
-                    subpixel_jitter,
-                    size=coordinates.shape,
-                ).astype(np.float32)
+            subpixel_jitter = 0.0
             coordinates, target_coordinates = _limit_visible_coordinates(
                 coordinates,
                 config.image_shape,

@@ -19,13 +19,13 @@ parameters:
   # Output image size as [height, width] in pixels.
   image_shape: [512, 512]
   # Minimum number of visible atom centers requested per image.
-  min_atoms: 600
+  min_atoms: 1300
   # Maximum number of visible atom centers requested per image.
-  max_atoms: 800
+  max_atoms: 1500
   # Fallback minimum center-to-center atom spacing in pixels.
   min_separation: 12.5
   # Per-image random range for minimum atom spacing in pixels; overrides min_separation when set.
-  min_separation_range: [5.0, 15.0]
+  min_separation_range: [11.0, 15.0]
   # Per-image maximum absolute x/y subpixel jitter in pixels after discrete candidate placement.
   subpixel_jitter_range: [0.5, 0.5]
   # Per-atom Gaussian width range in pixels; larger values make atom blobs wider.
