@@ -275,6 +275,22 @@ def _collect_offsets_for_model(
     return collect_matched_offsets(model, loader, device, threshold_rel, match_distance)
 
 
+def _annotate_probability_metric(ax: plt.Axes, result: dict[str, np.ndarray | float | int] | None) -> None:
+    if result is None:
+        return
+    ax.text(
+        0.04,
+        0.96,
+        f"F1={float(result['f1']):.3f}",
+        transform=ax.transAxes,
+        ha='left',
+        va='top',
+        color='#1f1f1f',
+        fontsize=7.5,
+        bbox={'facecolor': 'white', 'edgecolor': 'none', 'alpha': 0.78, 'boxstyle': 'round,pad=0.18'},
+    )
+
+
 def make_figure_1(args: argparse.Namespace) -> Path:
     repo_root = _repo_root()
     output_dir = args.output_dir
@@ -330,11 +346,11 @@ def make_figure_1(args: argparse.Namespace) -> Path:
         ax = fig.add_subplot(grid[row, 0])
         _plot_clean_image(ax, examples[dataset.key]['image'], f'{dataset.label} training example')
 
-    for row, model_spec in enumerate(models):
-        for col, dataset in enumerate(datasets):
+    for row, dataset in enumerate(datasets):
+        for col, model_spec in enumerate(models):
             ax = fig.add_subplot(grid[row, col + 1])
             if row == 0:
-                ax.set_title(f'{dataset.label} test', fontsize=11)
+                ax.set_title(model_spec.label, fontsize=11)
             prediction = predictions.get((model_spec.key, dataset.key))
             if prediction is None:
                 _axis_missing(ax, 'Checkpoint missing')
@@ -342,14 +358,15 @@ def make_figure_1(args: argparse.Namespace) -> Path:
                 cmap = MODEL_CMAPS.get(model_spec.key, 'viridis')
                 ax.imshow(prediction, cmap=cmap, vmin=0.0, vmax=max(float(prediction.max()), 1e-6))
                 if col == 0:
-                    ax.set_ylabel(model_spec.label, fontsize=10)
+                    ax.set_ylabel(f'{dataset.label} test', fontsize=10)
                 ax.set_xticks([])
                 ax.set_yticks([])
+                _annotate_probability_metric(ax, offset_results.get((model_spec.key, dataset.key)))
 
-        for col, dataset in enumerate(datasets):
+        for col, model_spec in enumerate(models):
             ax = fig.add_subplot(grid[row, col + 4])
             if row == 0:
-                ax.set_title(f'{dataset.label} offsets', fontsize=11)
+                ax.set_title(f'{model_spec.label} offsets', fontsize=11)
             result = offset_results.get((model_spec.key, dataset.key))
             if result is None:
                 _axis_missing(ax, 'Checkpoint missing')
@@ -647,24 +664,24 @@ def _plot_pixel_size_sweep_stack(top_ax: plt.Axes, bottom_ax: plt.Axes, rows: li
     feature_color = '#426aa8'
     spacing_color = '#8a58a2'
 
-    top_ax.plot(pixel_size, f1, color=f1_color, marker='o', linewidth=2.2, markersize=5.5, label='Localization F1')
+    f1_line = top_ax.plot(pixel_size, f1, color=f1_color, marker='o', linewidth=2.2, markersize=5.5, label='Localization F1')[0]
     for x, value in zip(pixel_size, f1):
         top_ax.text(float(x), float(value) + 0.018, f'{value:.3f}', ha='center', va='bottom', fontsize=8.5, color='#222222')
-    top_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35, label='training scale (factor=1)')
+    train_line = top_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35, label='value used in training')
     top_ax.set_ylabel('Localization F1 (higher is better)', fontsize=11)
     top_ax.set_ylim(0.0, 1.02)
     top_ax.grid(alpha=0.25)
-    top_ax.legend(loc='lower left', fontsize=8.5, frameon=True)
 
     rmse_ax = top_ax.twinx()
-    rmse_ax.plot(pixel_size, rmse, color=rmse_color, marker='s', linewidth=2.0, markersize=5.0)
+    rmse_line = rmse_ax.plot(pixel_size, rmse, color=rmse_color, marker='s', linewidth=2.0, markersize=5.0, label='Localization RMSE')[0]
     rmse_ax.set_ylabel('Localization RMSE (px, lower is better)', fontsize=11, color='#8f4d31')
     rmse_ax.tick_params(axis='y', colors='#8f4d31')
     rmse_ax.set_ylim(0.0, max(float(rmse.max()) * 1.05, 0.5))
+    top_ax.legend(handles=[f1_line, rmse_line, train_line], loc='lower left', fontsize=8.5, frameon=True)
 
     bottom_ax.plot(pixel_size, feature_ratio, color=feature_color, marker='o', linewidth=2.2, markersize=5.5, label='mean blob width / receptive field')
     bottom_ax.plot(pixel_size, spacing_ratio, color=spacing_color, marker='s', linewidth=2.2, markersize=5.5, label='mean atom spacing / receptive field')
-    bottom_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35)
+    bottom_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35, label='value used in training')
     for x, y, spacing in zip(pixel_size, spacing_ratio, spacing_px):
         bottom_ax.text(float(x), float(y) + 0.018, f'{spacing:.1f}px spacing', rotation=18, ha='center', va='bottom', fontsize=7.5, color='#222222')
     bottom_ax.set_xlabel('Assumed pixel size (angstrom / px)', fontsize=11)
@@ -721,7 +738,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
 def _add_shared_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--output-dir', type=Path, default=Path('outputs/manuscript_figures'))
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda', 'mps'], default='auto')
-    parser.add_argument('--dpi', type=int, default=260)
+    parser.add_argument('--dpi', type=int, default=300)
 
 
 def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
