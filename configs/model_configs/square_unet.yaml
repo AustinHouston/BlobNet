@@ -16,8 +16,8 @@ loss:
 
 training:
   output_dir: outputs/manuscript_models/square
-  epochs: 200
-  batch_size: 8
+  epochs: 20
+  batch_size: 32
   learning_rate: 0.001
   device: cuda
   num_workers: 0
