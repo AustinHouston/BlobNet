@@ -777,6 +777,97 @@ def sample_structure_points(
     )
 
 
+def point_cloud_from_atoms(
+    atoms: Any,
+    image_shape: Tuple[int, int],
+    *,
+    species_intensity_power: float = 1.45,
+    intensity_range: Tuple[float, float] = (0.3, 1.0),
+    atom_sigma_range: Optional[Tuple[float, float]] = None,
+    coordinate_scale: float = 1.0,
+) -> PointCloud:
+    """Convert an ASE Atoms object with x/y positions into renderer-ready points."""
+
+    positions = np.asarray(atoms.get_positions(), dtype=np.float32)
+    if positions.ndim != 2 or positions.shape[1] < 2:
+        raise ValueError("Expected atoms positions with at least x/y columns.")
+
+    atomic_numbers = np.asarray(atoms.get_atomic_numbers(), dtype=np.float32)
+    if len(positions) != len(atomic_numbers):
+        raise ValueError("Atom positions and atomic numbers have different lengths.")
+
+    coordinates = (positions[:, [1, 0]] * float(coordinate_scale)).astype(np.float32)
+    visible = _in_frame_mask(coordinates, image_shape)
+
+    z_weights = atomic_numbers**float(species_intensity_power)
+    weight_min, weight_max = float(z_weights.min()), float(z_weights.max())
+    if weight_max > weight_min:
+        normalized = (z_weights - weight_min) / (weight_max - weight_min)
+    else:
+        normalized = np.ones_like(z_weights, dtype=np.float32)
+
+    intensity_low, intensity_high = intensity_range
+    intensities = (
+        float(intensity_low) + normalized * float(intensity_high - intensity_low)
+    ).astype(np.float32)
+
+    sigmas = None
+    if atom_sigma_range is not None:
+        sigma_low, sigma_high = atom_sigma_range
+        sigmas = (
+            float(sigma_low) + normalized * float(sigma_high - sigma_low)
+        ).astype(np.float32)
+
+    symbols = (
+        atoms.get_chemical_symbols()
+        if hasattr(atoms, "get_chemical_symbols")
+        else [str(int(value)) for value in atomic_numbers]
+    )
+    return PointCloud(
+        coordinates=coordinates,
+        target_coordinates=coordinates[visible].astype(np.float32),
+        intensities=intensities,
+        sigmas=sigmas,
+        metadata={
+            "image_type": "ase_atoms",
+            "atomic_numbers": atomic_numbers.astype(np.int32),
+            "symbols": list(symbols),
+            "visible_atom_count": int(visible.sum()),
+            "rendered_atom_count": int(len(coordinates)),
+        },
+    )
+
+
+def generate_atoms_microscope_image(
+    atoms: Any,
+    config: ImageFormationConfig,
+    rng: Optional[np.random.Generator] = None,
+    *,
+    species_intensity_power: float = 1.45,
+    atom_sigma_range: Optional[Tuple[float, float]] = None,
+    coordinate_scale: float = 1.0,
+) -> Dict[str, Any]:
+    """Render a user-constructed ASE Atoms object through the shared image model."""
+
+    points = point_cloud_from_atoms(
+        atoms,
+        config.image_shape,
+        species_intensity_power=species_intensity_power,
+        intensity_range=config.intensity_range,
+        atom_sigma_range=atom_sigma_range,
+        coordinate_scale=coordinate_scale,
+    )
+    return render_microscope_image(
+        points.coordinates,
+        config,
+        rng,
+        intensities=points.intensities,
+        sigmas=points.sigmas,
+        target_coordinates=points.target_coordinates,
+        metadata=points.metadata,
+    )
+
+
 def point_cloud_from_config(
     config: ImageFormationConfig,
     rng: Optional[np.random.Generator] = None,

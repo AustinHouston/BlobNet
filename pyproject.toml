@@ -27,6 +27,7 @@ dependencies = [
 [project.scripts]
 blobnet-generate-dataset = "scripts.generate_training_dataset:main"
 blobnet-train = "scripts.train_unet:main"
+blobnet-manuscript-figures = "scripts.make_manuscript_figures:main"
 
 [tool.setuptools]
 packages = ["blobnet", "scripts"]
