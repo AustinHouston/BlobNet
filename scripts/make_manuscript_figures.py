@@ -29,19 +29,19 @@ from matplotlib.colors import LogNorm
 
 from blobnet.networks import build_unet
 from blobnet.synthetic import (
+    GeneratedAtomImageDataset,
     ImageFormationConfig,
     PeriodicLatticeConfig,
-    RandomMicroscopeImageConfig,
-    SyntheticMicroscopeDataset,
-    generate_atoms_microscope_image,
-    generate_microscope_image,
+    RandomAtomImageConfig,
+    generate_atom_image,
+    generate_atoms_image,
     metadata_collate,
 )
 from blobnet.visualization import collect_matched_offsets
 
 
 DATASET_TYPES = {
-    'random': RandomMicroscopeImageConfig,
+    'random': RandomAtomImageConfig,
     'periodic_lattice': PeriodicLatticeConfig,
 }
 
@@ -239,9 +239,9 @@ def _plot_clean_image(ax: plt.Axes, image: np.ndarray, title: str, cmap: str = '
 
 def _make_dataset_specs(repo_root: Path) -> list[DatasetSpec]:
     configs = {
-        'square': repo_root / 'configs/dataset_configs/square_2026_06_24a.yaml',
-        'hexagonal': repo_root / 'configs/dataset_configs/hexagonal_2026_06_24a.yaml',
-        'random': repo_root / 'configs/dataset_configs/random_2026_06_24a.yaml',
+        'square': repo_root / 'configs/dataset_configs/square.yaml',
+        'hexagonal': repo_root / 'configs/dataset_configs/hexagonal.yaml',
+        'random': repo_root / 'configs/dataset_configs/random.yaml',
     }
     labels = {'square': 'Square', 'hexagonal': 'Hexagonal', 'random': 'Random'}
     return [DatasetSpec(key, labels[key], _read_yaml_config(path)) for key, path in configs.items()]
@@ -266,7 +266,7 @@ def _collect_offsets_for_model(
     match_distance: float,
 ) -> dict[str, np.ndarray | float | int]:
     loader = DataLoader(
-        SyntheticMicroscopeDataset(samples, dataset.config, seed=seed, return_metadata=True),
+        GeneratedAtomImageDataset(samples, dataset.config, seed=seed, return_metadata=True),
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
@@ -284,7 +284,7 @@ def make_figure_1(args: argparse.Namespace) -> Path:
     models = _make_model_specs(args)
 
     examples = {
-        dataset.key: generate_microscope_image(dataset.config, np.random.default_rng(args.seed + index))
+        dataset.key: generate_atom_image(dataset.config, np.random.default_rng(args.seed + index))
         for index, dataset in enumerate(datasets)
     }
     loaded_models: dict[str, torch.nn.Module | None] = {}
@@ -496,7 +496,7 @@ def _render_atoms_stem_panel(
     seed: int,
     atom_sigma_range: tuple[float, float],
 ) -> np.ndarray:
-    rendered = generate_atoms_microscope_image(
+    rendered = generate_atoms_image(
         atoms,
         _stem_like_render_config(shape, atom_sigma_range),
         np.random.default_rng(seed),
@@ -664,7 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(figure1)
     figure1.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
     figure1.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    figure1.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth')
+    figure1.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     figure1.add_argument('--seed', type=int, default=0)
     figure1.add_argument('--offset-samples', type=int, default=32)
     figure1.add_argument('--batch-size', type=int, default=4)
@@ -677,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure2 = subparsers.add_parser('figure2', help='Experimental HAADF input/output figure.')
     _add_shared_arguments(figure2)
     _add_model_arguments(figure2)
-    figure2.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth')
+    figure2.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     figure2.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     figure2.add_argument('--tile-size', type=int, default=256)
     figure2.add_argument('--tile-overlap', type=int, default=64)
@@ -689,7 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3 = subparsers.add_parser('figure3', help='Scale and spacing robustness figure.')
     _add_shared_arguments(figure3)
     _add_model_arguments(figure3)
-    figure3.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth')
+    figure3.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     figure3.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
     figure3.set_defaults(func=make_figure_3)
 
@@ -698,8 +698,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(all_parser)
     all_parser.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
     all_parser.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    all_parser.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth')
-    all_parser.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth')
+    all_parser.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    all_parser.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     all_parser.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     all_parser.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
     all_parser.add_argument('--seed', type=int, default=0)
