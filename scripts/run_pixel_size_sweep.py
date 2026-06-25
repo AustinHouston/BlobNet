@@ -22,6 +22,7 @@ import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import yaml
 
 from blobnet.metrics import aggregate_localization_metrics, evaluate_heatmap_localization
 from blobnet.networks import build_unet
@@ -101,30 +102,114 @@ def _scaled_px(train_value_px: float, pixel_size_factor: float, fixed_evaluation
     return float(train_value_px) / float(pixel_size_factor)
 
 
+def _read_random_dataset_parameters(path: Path) -> tuple[dict[str, Any], str]:
+    raw = yaml.safe_load(path.read_text())
+    dataset_type = raw.get('type') or raw.get('dataset', {}).get('type')
+    if dataset_type != 'random':
+        raise ValueError(f'Pixel-size sweep expects a random dataset config, got {dataset_type!r} in {path}')
+    parameters = raw.get('parameters')
+    if not isinstance(parameters, dict):
+        raise ValueError(f'Missing parameters in {path}')
+    return dict(parameters), str(path)
+
+
+def _resolve_training_parameters(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+    if args.dataset_config is not None:
+        return _read_random_dataset_parameters(args.dataset_config)
+
+    resolved_config = args.checkpoint.parent / 'resolved_config.yaml'
+    if resolved_config.is_file():
+        resolved = yaml.safe_load(resolved_config.read_text())
+        dataset_path = Path(resolved['dataset']['path'])
+        manifest_path = dataset_path / 'dataset_manifest.yaml'
+        if manifest_path.is_file():
+            return _read_random_dataset_parameters(manifest_path)
+
+    return _read_random_dataset_parameters(Path('configs/dataset_configs/random.yaml'))
+
+
+def _range_from_parameters(parameters: dict[str, Any], name: str) -> tuple[float, float]:
+    value = parameters.get(name)
+    if value is None:
+        raise ValueError(f'Training dataset parameters must define {name}.')
+    return float(value[0]), float(value[1])
+
+
+def _optional_range_override(args: argparse.Namespace, low_name: str, high_name: str, fallback: tuple[float, float]) -> tuple[float, float]:
+    low = getattr(args, low_name)
+    high = getattr(args, high_name)
+    return (
+        float(fallback[0]) if low is None else float(low),
+        float(fallback[1]) if high is None else float(high),
+    )
+
+
+def _apply_training_defaults(args: argparse.Namespace) -> None:
+    parameters, source = _resolve_training_parameters(args)
+    args.training_parameters = parameters
+    args.training_parameter_source = source
+
+    image_shape = parameters.get('image_shape', [256, 256])
+    args.height = int(image_shape[0]) if args.height is None else int(args.height)
+    args.width = int(image_shape[1]) if args.width is None else int(args.width)
+    args.min_atoms = int(parameters.get('min_atoms', 80)) if args.min_atoms is None else int(args.min_atoms)
+    args.max_atoms = int(parameters.get('max_atoms', args.min_atoms)) if args.max_atoms is None else int(args.max_atoms)
+
+    sigma_min, sigma_max = _range_from_parameters(parameters, 'sigma_range')
+    args.train_sigma_min = sigma_min if args.train_sigma_min is None else float(args.train_sigma_min)
+    args.train_sigma_max = sigma_max if args.train_sigma_max is None else float(args.train_sigma_max)
+    args.train_target_sigma = float(parameters.get('target_sigma', 0.9)) if args.train_target_sigma is None else float(args.train_target_sigma)
+
+    spacing_range = parameters.get('min_separation_range')
+    if spacing_range is None:
+        spacing = float(parameters.get('min_separation', 12.0))
+        spacing_range = (spacing, spacing)
+    args.train_min_separation_range_min = (
+        float(spacing_range[0])
+        if args.train_min_separation_range_min is None
+        else float(args.train_min_separation_range_min)
+    )
+    args.train_min_separation_range_max = (
+        float(spacing_range[1])
+        if args.train_min_separation_range_max is None
+        else float(args.train_min_separation_range_max)
+    )
+    args.train_match_distance = 1.5 * args.train_target_sigma if args.train_match_distance is None else float(args.train_match_distance)
+    args.train_peak_min_distance = max(1, int(round(args.train_target_sigma * 1.5))) if args.train_peak_min_distance is None else int(args.train_peak_min_distance)
+    args.train_peak_window_size = _odd_pixel_count(args.train_target_sigma * 2.5) if args.train_peak_window_size is None else int(args.train_peak_window_size)
+
+
+def _range_override(args: argparse.Namespace, parameters: dict[str, Any], field: str, low_name: str, high_name: str) -> tuple[float, float]:
+    return _optional_range_override(args, low_name, high_name, _range_from_parameters(parameters, field))
+
+
 def _build_random_config(args: argparse.Namespace, pixel_size_factor: float) -> tuple[RandomAtomImageConfig, dict[str, float]]:
+    parameters = dict(args.training_parameters)
     sigma_min = _scaled_px(args.train_sigma_min, pixel_size_factor, args.fixed_evaluation_pixels)
     sigma_max = _scaled_px(args.train_sigma_max, pixel_size_factor, args.fixed_evaluation_pixels)
     target_sigma = _scaled_px(args.train_target_sigma, pixel_size_factor, args.fixed_evaluation_pixels)
     spacing_min = _scaled_px(args.train_min_separation_range_min, pixel_size_factor, args.fixed_evaluation_pixels)
     spacing_max = _scaled_px(args.train_min_separation_range_max, pixel_size_factor, args.fixed_evaluation_pixels)
-    config = RandomAtomImageConfig(
-        image_shape=(args.height, args.width),
-        min_atoms=args.min_atoms,
-        max_atoms=args.max_atoms,
-        min_separation=0.5 * (spacing_min + spacing_max),
-        min_separation_range=(spacing_min, spacing_max),
-        sigma_range=(sigma_min, sigma_max),
-        intensity_range=(0.1, 1.0),
-        target_sigma=target_sigma,
-        background_range=(args.background_min, args.background_max),
-        gradient_range=(-0.1, 0.1),
-        inhomogeneous_background_range=(args.inhom_background_min, args.inhom_background_max),
-        low_frequency_noise_range=(args.low_freq_noise_min, args.low_freq_noise_max),
-        read_noise_std_range=(args.read_noise_min, args.read_noise_max),
-        total_counts_range=(args.total_counts_min, args.total_counts_max),
-        blur_sigma_range=(args.blur_sigma_min, args.blur_sigma_max),
-        edge_padding=args.edge_padding,
+    parameters.update(
+        {
+            'image_shape': (args.height, args.width),
+            'min_atoms': args.min_atoms,
+            'max_atoms': args.max_atoms,
+            'min_separation': 0.5 * (spacing_min + spacing_max),
+            'min_separation_range': (spacing_min, spacing_max),
+            'sigma_range': (sigma_min, sigma_max),
+            'target_sigma': target_sigma,
+            'background_range': _range_override(args, parameters, 'background_range', 'background_min', 'background_max'),
+            'inhomogeneous_background_range': _range_override(args, parameters, 'inhomogeneous_background_range', 'inhom_background_min', 'inhom_background_max'),
+            'low_frequency_noise_range': _range_override(args, parameters, 'low_frequency_noise_range', 'low_freq_noise_min', 'low_freq_noise_max'),
+            'read_noise_std_range': _range_override(args, parameters, 'read_noise_std_range', 'read_noise_min', 'read_noise_max'),
+            'total_counts_range': _range_override(args, parameters, 'total_counts_range', 'total_counts_min', 'total_counts_max'),
+            'blur_sigma_range': _range_override(args, parameters, 'blur_sigma_range', 'blur_sigma_min', 'blur_sigma_max'),
+            'edge_padding': int(parameters.get('edge_padding', 0)) if args.edge_padding is None else int(args.edge_padding),
+        }
     )
+    config_fields = RandomAtomImageConfig.__dataclass_fields__
+    config = RandomAtomImageConfig(**{name: parameters[name] for name in config_fields if name in parameters})
     return config, {
         'sigma_min_px': sigma_min,
         'sigma_max_px': sigma_max,
@@ -234,13 +319,13 @@ def _save_accuracy_plot(path: Path, rows: list[dict[str, Any]]) -> None:
     sorted_rows = sorted(rows, key=lambda row: row['pixel_size_angstrom'])
     pixel_sizes = [row['pixel_size_angstrom'] for row in sorted_rows]
     fig, axis = plt.subplots(figsize=(8.5, 5.2), constrained_layout=True)
-    axis.plot(pixel_sizes, [row['f1'] for row in sorted_rows], marker='o', label='F1')
-    axis.set(xlabel='Pixel size (angstrom / px)', ylabel='Localization F1', ylim=(0.0, 1.02))
+    axis.plot(pixel_sizes, [row['f1'] for row in sorted_rows], marker='o', label='Localization F1')
+    axis.set(xlabel='Assumed pixel size (angstrom / px)', ylabel='Localization F1 (higher is better)', ylim=(0.0, 1.02))
     axis.grid(alpha=0.25)
     ratio_axis = axis.twinx()
-    ratio_axis.plot(pixel_sizes, [row['feature_fwhm_over_bottleneck_rf'] for row in sorted_rows], marker='s', color='#426aa8', label='feature FWHM / RF')
-    ratio_axis.plot(pixel_sizes, [row['spacing_over_bottleneck_rf'] for row in sorted_rows], marker='^', color='#8a58a2', label='spacing / RF')
-    ratio_axis.set_ylabel('Ratio to bottleneck receptive field')
+    ratio_axis.plot(pixel_sizes, [row['feature_fwhm_over_bottleneck_rf'] for row in sorted_rows], marker='s', color='#426aa8', label='blob width / receptive field')
+    ratio_axis.plot(pixel_sizes, [row['spacing_over_bottleneck_rf'] for row in sorted_rows], marker='^', color='#8a58a2', label='atom spacing / receptive field')
+    ratio_axis.set_ylabel('Ratio to 68 px U-Net bottleneck receptive field')
     lines, labels = axis.get_legend_handles_labels()
     ratio_lines, ratio_labels = ratio_axis.get_legend_handles_labels()
     axis.legend(lines + ratio_lines, labels + ratio_labels, loc='best')
@@ -284,37 +369,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--samples-per-size', type=int, default=64)
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--height', type=int, default=256)
-    parser.add_argument('--width', type=int, default=256)
+    parser.add_argument('--dataset-config', type=Path, help='Random dataset config to use for factor-1 sweep geometry.')
+    parser.add_argument('--height', type=int)
+    parser.add_argument('--width', type=int)
     parser.add_argument('--train-pixel-size-angstrom', type=float, default=DEFAULT_TRAIN_PIXEL_SIZE_ANGSTROM)
     parser.add_argument('--pixel-size-factors', type=_parse_float_list, default=DEFAULT_PIXEL_SIZE_FACTORS)
     parser.add_argument('--pixel-sizes-angstrom', type=_parse_float_list)
     parser.add_argument('--num-filters', type=int, nargs='+', default=[32, 64, 128, 256])
     parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--train-sigma-min', type=float, default=2.8)
-    parser.add_argument('--train-sigma-max', type=float, default=4.3)
-    parser.add_argument('--train-target-sigma', type=float, default=0.9)
-    parser.add_argument('--train-min-separation-range-min', type=float, default=12.5)
-    parser.add_argument('--train-min-separation-range-max', type=float, default=16.7)
-    parser.add_argument('--min-atoms', type=int, default=80)
-    parser.add_argument('--max-atoms', type=int, default=180)
-    parser.add_argument('--background-min', type=float, default=0.0)
-    parser.add_argument('--background-max', type=float, default=0.3)
-    parser.add_argument('--inhom-background-min', type=float, default=0.0)
-    parser.add_argument('--inhom-background-max', type=float, default=0.16)
-    parser.add_argument('--low-freq-noise-min', type=float, default=0.05)
-    parser.add_argument('--low-freq-noise-max', type=float, default=0.28)
-    parser.add_argument('--read-noise-min', type=float, default=0.02)
-    parser.add_argument('--read-noise-max', type=float, default=0.12)
-    parser.add_argument('--total-counts-min', type=float, default=50.0)
-    parser.add_argument('--total-counts-max', type=float, default=25000.0)
-    parser.add_argument('--blur-sigma-min', type=float, default=0.2)
-    parser.add_argument('--blur-sigma-max', type=float, default=1.1)
-    parser.add_argument('--edge-padding', type=int, default=16)
+    parser.add_argument('--train-sigma-min', type=float)
+    parser.add_argument('--train-sigma-max', type=float)
+    parser.add_argument('--train-target-sigma', type=float)
+    parser.add_argument('--train-min-separation-range-min', type=float)
+    parser.add_argument('--train-min-separation-range-max', type=float)
+    parser.add_argument('--min-atoms', type=int)
+    parser.add_argument('--max-atoms', type=int)
+    parser.add_argument('--background-min', type=float)
+    parser.add_argument('--background-max', type=float)
+    parser.add_argument('--inhom-background-min', type=float)
+    parser.add_argument('--inhom-background-max', type=float)
+    parser.add_argument('--low-freq-noise-min', type=float)
+    parser.add_argument('--low-freq-noise-max', type=float)
+    parser.add_argument('--read-noise-min', type=float)
+    parser.add_argument('--read-noise-max', type=float)
+    parser.add_argument('--total-counts-min', type=float)
+    parser.add_argument('--total-counts-max', type=float)
+    parser.add_argument('--blur-sigma-min', type=float)
+    parser.add_argument('--blur-sigma-max', type=float)
+    parser.add_argument('--edge-padding', type=int)
     parser.add_argument('--threshold-grid', type=_parse_float_list, default=DEFAULT_THRESHOLD_GRID)
-    parser.add_argument('--train-match-distance', type=float, default=3.0)
-    parser.add_argument('--train-peak-min-distance', type=int, default=3)
-    parser.add_argument('--train-peak-window-size', type=int, default=5)
+    parser.add_argument('--train-match-distance', type=float)
+    parser.add_argument('--train-peak-min-distance', type=int)
+    parser.add_argument('--train-peak-window-size', type=int)
     parser.add_argument('--fixed-evaluation-pixels', action='store_true')
     parser.add_argument('--example-size-count', type=int)
     return parser
@@ -325,6 +411,7 @@ def generate_pixel_size_sweep(args: argparse.Namespace) -> Path:
         raise ValueError('--samples-per-size must be greater than zero.')
     if not args.threshold_grid:
         raise ValueError('--threshold-grid must contain at least one value.')
+    _apply_training_defaults(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
     model = _load_model(args.checkpoint, device, args.num_filters, args.dropout)
@@ -354,6 +441,7 @@ def generate_pixel_size_sweep(args: argparse.Namespace) -> Path:
         'args': {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         'bottleneck_receptive_field_px': BOTTLENECK_RECEPTIVE_FIELD_PX,
         'tested_pixel_sizes_angstrom': [row['pixel_size_angstrom'] for row in rows],
+        'training_parameter_source': args.training_parameter_source,
         'training_physical_priors': {
             'sigma_range_angstrom': [args.train_sigma_min * args.train_pixel_size_angstrom, args.train_sigma_max * args.train_pixel_size_angstrom],
             'target_sigma_angstrom': args.train_target_sigma * args.train_pixel_size_angstrom,

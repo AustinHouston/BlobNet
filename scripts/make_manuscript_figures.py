@@ -554,7 +554,22 @@ def _read_sweep_rows(csv_path: Path) -> list[dict[str, float]]:
 
 
 def _generate_missing_sweep_csv(args: argparse.Namespace) -> None:
-    if args.sweep_csv.exists():
+    if args.sweep_csv.exists() and not args.regenerate_sweep:
+        sweep_config_path = args.sweep_csv.parent / 'pixel_size_sweep_config.json'
+        if sweep_config_path.is_file():
+            try:
+                sweep_config = json.loads(sweep_config_path.read_text())
+            except json.JSONDecodeError:
+                sweep_config = {}
+            if sweep_config.get('training_parameter_source'):
+                return
+        print('Existing sweep CSV has no training-parameter metadata; regenerating it.', flush=True)
+    elif args.sweep_csv.exists():
+        print(f'Regenerating pixel-size sweep at {args.sweep_csv.parent}', flush=True)
+    else:
+        print(f'Missing sweep CSV; generating pixel-size sweep at {args.sweep_csv.parent}', flush=True)
+
+    if args.sweep_csv.exists() and args.sweep_csv.name != 'pixel_size_metrics.csv':
         return
     if args.sweep_csv.name != 'pixel_size_metrics.csv':
         raise FileNotFoundError(
@@ -572,41 +587,41 @@ def _generate_missing_sweep_csv(args: argparse.Namespace) -> None:
         samples_per_size=args.sweep_samples,
         batch_size=args.batch_size,
         num_workers=0,
-        height=256,
-        width=256,
+        dataset_config=args.sweep_dataset_config,
+        height=None,
+        width=None,
         train_pixel_size_angstrom=0.1062231596676199,
         pixel_size_factors=DEFAULT_PIXEL_SIZE_FACTORS,
         pixel_sizes_angstrom=None,
         num_filters=args.num_filters,
         dropout=args.dropout,
-        train_sigma_min=2.8,
-        train_sigma_max=4.3,
-        train_target_sigma=0.9,
-        train_min_separation_range_min=12.5,
-        train_min_separation_range_max=16.7,
-        min_atoms=80,
-        max_atoms=180,
-        background_min=0.0,
-        background_max=0.3,
-        inhom_background_min=0.0,
-        inhom_background_max=0.16,
-        low_freq_noise_min=0.05,
-        low_freq_noise_max=0.28,
-        read_noise_min=0.02,
-        read_noise_max=0.12,
-        total_counts_min=50.0,
-        total_counts_max=25000.0,
-        blur_sigma_min=0.2,
-        blur_sigma_max=1.1,
-        edge_padding=16,
+        train_sigma_min=None,
+        train_sigma_max=None,
+        train_target_sigma=None,
+        train_min_separation_range_min=None,
+        train_min_separation_range_max=None,
+        min_atoms=None,
+        max_atoms=None,
+        background_min=None,
+        background_max=None,
+        inhom_background_min=None,
+        inhom_background_max=None,
+        low_freq_noise_min=None,
+        low_freq_noise_max=None,
+        read_noise_min=None,
+        read_noise_max=None,
+        total_counts_min=None,
+        total_counts_max=None,
+        blur_sigma_min=None,
+        blur_sigma_max=None,
+        edge_padding=None,
         threshold_grid=DEFAULT_THRESHOLD_GRID,
-        train_match_distance=3.0,
-        train_peak_min_distance=3,
-        train_peak_window_size=5,
+        train_match_distance=None,
+        train_peak_min_distance=None,
+        train_peak_window_size=None,
         fixed_evaluation_pixels=False,
         example_size_count=None,
     )
-    print(f'Missing sweep CSV; generating pixel-size sweep at {args.sweep_csv.parent}', flush=True)
     generated_path = generate_pixel_size_sweep(sweep_args)
     if generated_path != args.sweep_csv:
         raise FileNotFoundError(f'Expected sweep CSV at {args.sweep_csv}, generated {generated_path}')
@@ -632,28 +647,28 @@ def _plot_pixel_size_sweep_stack(top_ax: plt.Axes, bottom_ax: plt.Axes, rows: li
     feature_color = '#426aa8'
     spacing_color = '#8a58a2'
 
-    top_ax.plot(pixel_size, f1, color=f1_color, marker='o', linewidth=2.2, markersize=5.5, label='F1')
+    top_ax.plot(pixel_size, f1, color=f1_color, marker='o', linewidth=2.2, markersize=5.5, label='Localization F1')
     for x, value in zip(pixel_size, f1):
         top_ax.text(float(x), float(value) + 0.018, f'{value:.3f}', ha='center', va='bottom', fontsize=8.5, color='#222222')
-    top_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35, label='training pixel size')
-    top_ax.set_ylabel('Localization F1', fontsize=11)
+    top_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35, label='training scale (factor=1)')
+    top_ax.set_ylabel('Localization F1 (higher is better)', fontsize=11)
     top_ax.set_ylim(0.0, 1.02)
     top_ax.grid(alpha=0.25)
     top_ax.legend(loc='lower left', fontsize=8.5, frameon=True)
 
     rmse_ax = top_ax.twinx()
     rmse_ax.plot(pixel_size, rmse, color=rmse_color, marker='s', linewidth=2.0, markersize=5.0)
-    rmse_ax.set_ylabel('RMSE (px)', fontsize=11, color='#8f4d31')
+    rmse_ax.set_ylabel('Localization RMSE (px, lower is better)', fontsize=11, color='#8f4d31')
     rmse_ax.tick_params(axis='y', colors='#8f4d31')
     rmse_ax.set_ylim(0.0, max(float(rmse.max()) * 1.05, 0.5))
 
-    bottom_ax.plot(pixel_size, feature_ratio, color=feature_color, marker='o', linewidth=2.2, markersize=5.5, label='mean feature FWHM / bottleneck RF')
-    bottom_ax.plot(pixel_size, spacing_ratio, color=spacing_color, marker='s', linewidth=2.2, markersize=5.5, label='mean atom spacing / bottleneck RF')
+    bottom_ax.plot(pixel_size, feature_ratio, color=feature_color, marker='o', linewidth=2.2, markersize=5.5, label='mean blob width / receptive field')
+    bottom_ax.plot(pixel_size, spacing_ratio, color=spacing_color, marker='s', linewidth=2.2, markersize=5.5, label='mean atom spacing / receptive field')
     bottom_ax.axvline(train_pixel_size, color='black', linestyle='--', linewidth=1.35)
     for x, y, spacing in zip(pixel_size, spacing_ratio, spacing_px):
         bottom_ax.text(float(x), float(y) + 0.018, f'{spacing:.1f}px spacing', rotation=18, ha='center', va='bottom', fontsize=7.5, color='#222222')
-    bottom_ax.set_xlabel('Pixel size (angstrom / px)', fontsize=11)
-    bottom_ax.set_ylabel('Size relative to bottleneck RF (68 px)', fontsize=11)
+    bottom_ax.set_xlabel('Assumed pixel size (angstrom / px)', fontsize=11)
+    bottom_ax.set_ylabel('Ratio to U-Net bottleneck receptive field (68 px)', fontsize=11)
     bottom_ax.set_ylim(0.0, max(0.9, float(spacing_ratio.max()) * 1.05))
     bottom_ax.grid(alpha=0.25)
     bottom_ax.legend(loc='upper right', fontsize=8.5, frameon=True)
@@ -751,7 +766,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(figure3)
     figure3.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     figure3.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
+    figure3.add_argument('--sweep-dataset-config', type=Path)
     figure3.add_argument('--sweep-samples', type=int, default=64)
+    figure3.add_argument('--regenerate-sweep', action='store_true')
     figure3.add_argument('--batch-size', type=int, default=8)
     figure3.set_defaults(func=make_figure_3)
 
@@ -764,7 +781,9 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     all_parser.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     all_parser.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
+    all_parser.add_argument('--sweep-dataset-config', type=Path)
     all_parser.add_argument('--sweep-samples', type=int, default=64)
+    all_parser.add_argument('--regenerate-sweep', action='store_true')
     all_parser.add_argument('--seed', type=int, default=0)
     all_parser.add_argument('--offset-samples', type=int, default=32)
     all_parser.add_argument('--batch-size', type=int, default=4)
