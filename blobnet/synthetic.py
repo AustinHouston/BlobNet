@@ -45,6 +45,7 @@ class RandomAtomImageConfig(ImageFormationConfig):
     max_atoms: int = 36
     min_separation: float = 4.0
     min_separation_range: Optional[Tuple[float, float]] = None
+    subpixel_jitter_range: Tuple[float, float] = (0.0, 0.0)
 
 
 @dataclass(frozen=True)
@@ -355,6 +356,13 @@ def sample_random_atom_points(
         coordinates = sample_atom_coordinates(
             config, rng, atom_count=desired_visible_count, min_separation=min_separation
         )
+        subpixel_jitter = _sample_scalar(rng, config.subpixel_jitter_range)
+        if subpixel_jitter > 0:
+            coordinates = coordinates + rng.uniform(
+                -subpixel_jitter,
+                subpixel_jitter,
+                size=coordinates.shape,
+            ).astype(np.float32)
         target_coordinates = coordinates
     else:
         expanded_shape = _expanded_shape(config.image_shape, padding)
@@ -371,6 +379,7 @@ def sample_random_atom_points(
         best_coordinates = np.zeros((0, 2), dtype=np.float32)
         best_target = np.zeros((0, 2), dtype=np.float32)
         best_score: Optional[Tuple[int, int]] = None
+        best_subpixel_jitter = 0.0
 
         for _ in range(24):
             padded = sample_atom_coordinates(
@@ -381,6 +390,13 @@ def sample_random_atom_points(
                 boundary_margin=boundary_margin,
             )
             coordinates = _shift_coordinates(padded, (-padding, -padding))
+            subpixel_jitter = _sample_scalar(rng, config.subpixel_jitter_range)
+            if subpixel_jitter > 0:
+                coordinates = coordinates + rng.uniform(
+                    -subpixel_jitter,
+                    subpixel_jitter,
+                    size=coordinates.shape,
+                ).astype(np.float32)
             coordinates, target_coordinates = _limit_visible_coordinates(
                 coordinates,
                 config.image_shape,
@@ -393,9 +409,11 @@ def sample_random_atom_points(
             )
             if best_score is None or score < best_score:
                 best_coordinates, best_target, best_score = coordinates, target_coordinates, score
+                best_subpixel_jitter = subpixel_jitter
             if score[0] == 0:
                 break
         coordinates, target_coordinates = best_coordinates, best_target
+        subpixel_jitter = best_subpixel_jitter
 
     return PointCloud(
         coordinates=coordinates,
@@ -403,6 +421,7 @@ def sample_random_atom_points(
         metadata={
             "image_type": "random_atom_image",
             "sampled_min_separation": float(min_separation),
+            "sampled_subpixel_jitter": float(subpixel_jitter),
             "visible_atom_count": int(len(target_coordinates)),
             "rendered_atom_count": int(len(coordinates)),
         },

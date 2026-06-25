@@ -27,6 +27,8 @@ CHECKPOINTS = {
     'hexagonal': Path('outputs/manuscript_models/hexagonal/unet_best.pth'),
 }
 
+PIXEL_SIZE_SWEEP_DIR = Path('outputs/blobnet_pixel_size_sweep_random_4x')
+
 
 def run_command(command: list[str]) -> None:
     print('\n' + ' '.join(command), flush=True)
@@ -59,6 +61,9 @@ def main() -> int:
     parser.add_argument('--dataset-workers', type=int, default=0, help='Parallel workers for dataset generation. Use 0 for all available CPUs.')
     parser.add_argument('--skip-dataset-generation', action='store_true', help='Start at training and leave dataset directories untouched.')
     parser.add_argument('--regenerate-datasets', action='store_true', help='Overwrite and rebuild datasets before training.')
+    parser.add_argument('--skip-pixel-size-sweep', action='store_true')
+    parser.add_argument('--pixel-size-sweep-output-dir', type=Path, default=PIXEL_SIZE_SWEEP_DIR)
+    parser.add_argument('--pixel-size-sweep-samples', type=int, default=64)
     parser.add_argument('--skip-figures', action='store_true')
     args = parser.parse_args()
     if args.skip_dataset_generation and args.regenerate_datasets:
@@ -120,6 +125,20 @@ def main() -> int:
             metrics = json.loads(metrics_path.read_text())
             print(f"{name} test_loss={float(metrics['test_loss']):.6f}", flush=True)
 
+    if not args.skip_pixel_size_sweep:
+        run_command([
+            sys.executable,
+            'scripts/run_pixel_size_sweep.py',
+            '--output-dir',
+            str(args.pixel_size_sweep_output_dir),
+            '--checkpoint',
+            str(CHECKPOINTS['random']),
+            '--device',
+            args.device,
+            '--samples-per-size',
+            str(args.pixel_size_sweep_samples),
+        ])
+
     if not args.skip_figures:
         run_command([
             sys.executable,
@@ -137,6 +156,8 @@ def main() -> int:
             str(CHECKPOINTS['random']),
             '--checkpoint',
             str(CHECKPOINTS['random']),
+            '--sweep-csv',
+            str(args.pixel_size_sweep_output_dir / 'pixel_size_metrics.csv'),
         ])
 
     print('\nManuscript training pipeline complete.', flush=True)

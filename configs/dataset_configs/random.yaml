@@ -26,6 +26,8 @@ parameters:
   min_separation: 12.5
   # Per-image random range for minimum atom spacing in pixels; overrides min_separation when set.
   min_separation_range: [9.0, 15.0]
+  # Per-image maximum absolute x/y subpixel jitter in pixels after discrete candidate placement.
+  subpixel_jitter_range: [0.5, 0.5]
   # Per-atom Gaussian width range in pixels; larger values make atom blobs wider.
   sigma_range: [1.4, 3.0]
   # Per-atom brightness range before noise and normalization.
