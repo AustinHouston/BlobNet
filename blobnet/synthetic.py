@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -946,36 +948,57 @@ def metadata_collate(batch):
     return images, targets, metadata
 
 
+def _resolve_worker_count(num_workers: int, num_samples: int) -> int:
+    if num_samples <= 1:
+        return 1
+    if num_workers == 0:
+        return max(1, min(os.cpu_count() or 1, num_samples))
+    if num_workers < 0:
+        raise ValueError("num_workers must be >= 0. Use 0 for all available CPUs.")
+    return max(1, min(int(num_workers), num_samples))
+
+
+def _generate_and_save_one_sample(args: tuple[Path, int, ImageFormationConfig, int, str]) -> Path:
+    output_dir, idx, config, seed, prefix = args
+    image_record = generate_atom_image(config, np.random.default_rng(seed + idx))
+    file_path = output_dir / f"{prefix}_{idx:05d}.npz"
+    np.savez_compressed(
+        file_path,
+        image=image_record["image"],
+        target=image_record["target"],
+        coordinates=image_record["coordinates"],
+        intensities=image_record["intensities"],
+        sigmas=image_record["sigmas"],
+        count_map=image_record["count_map"],
+        total_counts=image_record["total_counts"],
+        count_scale=image_record["count_scale"],
+        config_json=json.dumps(image_record["config"]),
+    )
+    return file_path
+
+
 def generate_and_save_samples(
     output_dir: str | Path,
     num_samples: int,
     config: Optional[ImageFormationConfig] = None,
     seed: int = 0,
     prefix: str = "image",
+    num_workers: int = 0,
 ) -> List[Path]:
     """Generate atom image samples and save one NPZ file per sample."""
 
     config = config or RandomAtomImageConfig()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    paths: List[Path] = []
-    for idx in range(num_samples):
-        image_record = generate_atom_image(config, np.random.default_rng(seed + idx))
-        file_path = output_dir / f"{prefix}_{idx:05d}.npz"
-        np.savez_compressed(
-            file_path,
-            image=image_record["image"],
-            target=image_record["target"],
-            coordinates=image_record["coordinates"],
-            intensities=image_record["intensities"],
-            sigmas=image_record["sigmas"],
-            count_map=image_record["count_map"],
-            total_counts=image_record["total_counts"],
-            count_scale=image_record["count_scale"],
-            config_json=json.dumps(image_record["config"]),
-        )
-        paths.append(file_path)
-    return paths
+    num_samples = int(num_samples)
+    worker_count = _resolve_worker_count(int(num_workers), num_samples)
+    tasks = [(output_dir, idx, config, int(seed), prefix) for idx in range(num_samples)]
+
+    if worker_count == 1:
+        return [_generate_and_save_one_sample(task) for task in tasks]
+
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(_generate_and_save_one_sample, tasks))
 
 
 def generate_and_save_dataset_splits(
@@ -986,6 +1009,7 @@ def generate_and_save_dataset_splits(
     config: Optional[ImageFormationConfig] = None,
     seed: int = 0,
     prefix: str = "image",
+    num_workers: int = 0,
 ) -> Dict[str, List[Path]]:
     config = config or RandomAtomImageConfig()
     split_specs = [
@@ -994,6 +1018,13 @@ def generate_and_save_dataset_splits(
         ("test", int(test_samples), seed + 2_000_000),
     ]
     return {
-        split: generate_and_save_samples(Path(output_dir) / split, count, config, split_seed, prefix)
+        split: generate_and_save_samples(
+            Path(output_dir) / split,
+            count,
+            config,
+            split_seed,
+            prefix,
+            num_workers=num_workers,
+        )
         for split, count, split_seed in split_specs
     }

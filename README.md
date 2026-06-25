@@ -34,10 +34,12 @@ uv run blobnet-generate-dataset \
   --output-dir /tmp/blobnet_dataset \
   --train-samples 128 \
   --val-samples 32 \
-  --test-samples 32
+  --test-samples 32 \
+  --num-workers 0
 ```
 
 The generator writes one compressed NPZ file per sample under `train/`, `val/`, and `test/`, plus `dataset_manifest.yaml` with the resolved generation parameters.
+Use `--num-workers 0` to use all available CPU cores, or pass a positive worker count to cap CPU use.
 
 ## Train U-Net
 
@@ -85,6 +87,7 @@ uv run blobnet-train-manuscript --device auto
 ```
 
 This command regenerates the random, square, and hexagonal datasets with `--overwrite`, trains all three U-Nets from scratch, checks that each checkpoint was written, and rebuilds the manuscript figures.
+Dataset generation runs in parallel by default; use `--dataset-workers N` to cap it.
 
 ## Experimental Images
 

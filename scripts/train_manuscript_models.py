@@ -37,6 +37,7 @@ def main() -> int:
     parser.add_argument('--output-dir', type=Path, default=Path('outputs/manuscript_figures'))
     parser.add_argument('--epochs', type=int, help='Override epochs for every model config.')
     parser.add_argument('--batch-size', type=int, help='Override batch size for every model config.')
+    parser.add_argument('--dataset-workers', type=int, default=0, help='Parallel workers for dataset generation. Use 0 for all available CPUs.')
     parser.add_argument('--skip-figures', action='store_true')
     args = parser.parse_args()
 
@@ -47,6 +48,8 @@ def main() -> int:
             '--config',
             str(config_path),
             '--overwrite',
+            '--num-workers',
+            str(args.dataset_workers),
         ])
 
     for name, config_path in MODEL_CONFIGS.items():

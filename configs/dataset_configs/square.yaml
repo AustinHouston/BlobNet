@@ -11,9 +11,9 @@ dataset:
   prefix: sample
   # Number of generated samples per split.
   splits:
-    train: 8
-    val: 2
-    test: 2
+    train: 1024
+    val: 256
+    test: 256
 
 parameters:
   # Output image size as [height, width] in pixels.

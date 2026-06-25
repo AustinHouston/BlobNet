@@ -28,6 +28,7 @@ def main() -> int:
     parser.add_argument('--train-samples', type=int)
     parser.add_argument('--val-samples', type=int)
     parser.add_argument('--test-samples', type=int)
+    parser.add_argument('--num-workers', type=int, default=0, help='Parallel generation workers. Use 0 for all available CPUs.')
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
 
@@ -59,6 +60,7 @@ def main() -> int:
         config=image_config,
         seed=int(dataset_settings.get('seed', 0)),
         prefix=dataset_settings.get('prefix', 'sample'),
+        num_workers=args.num_workers,
     )
 
     manifest = {
@@ -66,6 +68,7 @@ def main() -> int:
         'type': dataset_type,
         'seed': int(dataset_settings.get('seed', 0)),
         'splits': {name: len(paths) for name, paths in saved.items()},
+        'num_workers': int(args.num_workers),
         'parameters': asdict(image_config),
         'source_config': str(args.config),
     }
