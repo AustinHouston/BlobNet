@@ -19,9 +19,9 @@ parameters:
   # Output image size as [height, width] in pixels.
   image_shape: [512, 512]
   # Minimum number of visible atom centers requested per image.
-  min_atoms: 300
+  min_atoms: 600
   # Maximum number of visible atom centers requested per image.
-  max_atoms: 400
+  max_atoms: 800
   # Fallback minimum center-to-center atom spacing in pixels.
   min_separation: 12.5
   # Per-image random range for minimum atom spacing in pixels; overrides min_separation when set.
