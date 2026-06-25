@@ -7,13 +7,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter
-from torch.utils.data import DataLoader, Dataset
-
-RESAMPLE_NEAREST = (
-    Image.Resampling.NEAREST if hasattr(Image, "Resampling") else Image.NEAREST
-)
+from torch.utils.data import Dataset
 
 
 @dataclass(frozen=True)
@@ -41,24 +36,13 @@ class ImageFormationConfig:
 
 
 @dataclass(frozen=True)
-class RandomMicroscopeImageConfig(ImageFormationConfig):
+class RandomAtomImageConfig(ImageFormationConfig):
     """Randomly placed atom-like peaks."""
 
     min_atoms: int = 8
     max_atoms: int = 36
     min_separation: float = 4.0
     min_separation_range: Optional[Tuple[float, float]] = None
-
-
-@dataclass(frozen=True)
-class TightSpacingRandomMicroscopeImageConfig(ImageFormationConfig):
-    """Disordered peaks with a tight nearest-neighbor spacing distribution."""
-
-    min_atoms: int = 8
-    max_atoms: int = 36
-    nearest_neighbor_spacing_range: Tuple[float, float] = (8.0, 12.0)
-    spacing_jitter_fraction_range: Tuple[float, float] = (0.03, 0.08)
-    min_spacing_fraction: float = 0.86
 
 
 @dataclass(frozen=True)
@@ -308,7 +292,7 @@ def _paint_offsets(
 
 
 def sample_atom_coordinates(
-    config: RandomMicroscopeImageConfig,
+    config: RandomAtomImageConfig,
     rng: Optional[np.random.Generator] = None,
     atom_count: Optional[int] = None,
     min_separation: Optional[float] = None,
@@ -352,8 +336,8 @@ def sample_atom_coordinates(
     return coordinates[:accepted].copy()
 
 
-def sample_random_points(
-    config: RandomMicroscopeImageConfig,
+def sample_random_atom_points(
+    config: RandomAtomImageConfig,
     rng: Optional[np.random.Generator] = None,
 ) -> PointCloud:
     rng = _as_rng(rng)
@@ -378,7 +362,7 @@ def sample_random_points(
             desired_visible_count,
             int(np.ceil(desired_visible_count * expanded_area / max(image_area, 1.0))),
         )
-        sampling_config = RandomMicroscopeImageConfig(
+        sampling_config = RandomAtomImageConfig(
             **{**asdict(config), "image_shape": expanded_shape}
         )
         boundary_margin = max(0.0, _support_margin_for_sigma(config.sigma_range) - padding)
@@ -415,121 +399,10 @@ def sample_random_points(
         coordinates=coordinates,
         target_coordinates=target_coordinates,
         metadata={
-            "image_type": "random_microscope_image",
+            "image_type": "random_atom_image",
             "sampled_min_separation": float(min_separation),
             "visible_atom_count": int(len(target_coordinates)),
             "rendered_atom_count": int(len(coordinates)),
-        },
-    )
-
-
-def _sample_tight_spacing_coordinates(
-    *,
-    shape: Tuple[int, int],
-    atom_count: int,
-    spacing: float,
-    spacing_jitter_fraction: float,
-    min_spacing_fraction: float,
-    boundary_margin: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    height, width = shape
-    if height <= 2.0 * boundary_margin or width <= 2.0 * boundary_margin:
-        raise ValueError("Image shape is too small for the requested boundary margin.")
-
-    min_spacing = max(0.0, float(spacing) * float(min_spacing_fraction))
-    min_link_spacing = max(0.0, float(spacing) * (1.0 - 2.0 * float(spacing_jitter_fraction)))
-    max_link_spacing = float(spacing) * (1.0 + 2.0 * float(spacing_jitter_fraction))
-    coordinates = np.empty((int(atom_count), 2), dtype=np.float32)
-    available = _valid_pixel_mask((height, width), boundary_margin)
-    first = _sample_coordinate_from_mask(available, rng)
-    if first is None:
-        raise RuntimeError("Failed to sample any tight-spacing coordinates.")
-    coordinates[0] = first
-    accepted = 1
-    exclusion_offsets = _offsets_between_radii(0.0, min_spacing)
-    link_offsets = _offsets_between_radii(min_link_spacing, max_link_spacing)
-    linked = np.zeros((height, width), dtype=bool)
-    _paint_offsets(available, first, exclusion_offsets, False)
-    _paint_offsets(linked, first, link_offsets, True)
-
-    for _ in range(max(0, int(atom_count) - 1)):
-        candidate = _sample_coordinate_from_mask(available & linked, rng)
-        if candidate is None:
-            break
-        coordinates[accepted] = candidate
-        _paint_offsets(available, candidate, exclusion_offsets, False)
-        _paint_offsets(linked, candidate, link_offsets, True)
-        accepted += 1
-
-    if accepted == 0:
-        raise RuntimeError("Failed to sample any tight-spacing coordinates.")
-    return coordinates[:accepted].copy()
-
-
-def sample_tight_spacing_random_points(
-    config: TightSpacingRandomMicroscopeImageConfig,
-    rng: Optional[np.random.Generator] = None,
-) -> PointCloud:
-    rng = _as_rng(rng)
-    spacing = _sample_scalar(rng, config.nearest_neighbor_spacing_range)
-    spacing_jitter_fraction = _sample_scalar(rng, config.spacing_jitter_fraction_range)
-    desired_visible_count = int(rng.integers(config.min_atoms, config.max_atoms + 1))
-    padding = max(0, int(config.edge_padding))
-    expanded_shape = _expanded_shape(config.image_shape, padding)
-    expanded_area = float(expanded_shape[0] * expanded_shape[1])
-    image_area = float(config.image_shape[0] * config.image_shape[1])
-    total_atom_count = (
-        desired_visible_count
-        if padding <= 0
-        else max(
-            desired_visible_count,
-            int(np.ceil(desired_visible_count * expanded_area / max(image_area, 1.0))),
-        )
-    )
-    boundary_margin = max(
-        0.0,
-        max(_support_margin_for_sigma(config.sigma_range), spacing) - padding,
-    )
-
-    best_coordinates = np.zeros((0, 2), dtype=np.float32)
-    best_target = np.zeros((0, 2), dtype=np.float32)
-    best_score: Optional[Tuple[int, int]] = None
-    for _ in range(32):
-        padded = _sample_tight_spacing_coordinates(
-            shape=expanded_shape,
-            atom_count=total_atom_count,
-            spacing=spacing,
-            spacing_jitter_fraction=spacing_jitter_fraction,
-            min_spacing_fraction=config.min_spacing_fraction,
-            boundary_margin=boundary_margin,
-            rng=rng,
-        )
-        coordinates = _shift_coordinates(padded, (-padding, -padding))
-        coordinates, target_coordinates = _limit_visible_coordinates(
-            coordinates,
-            config.image_shape,
-            config.max_atoms,
-            rng,
-        )
-        score = (
-            0 if config.min_atoms <= len(target_coordinates) <= config.max_atoms else 1,
-            abs(len(target_coordinates) - desired_visible_count),
-        )
-        if best_score is None or score < best_score:
-            best_coordinates, best_target, best_score = coordinates, target_coordinates, score
-        if score[0] == 0:
-            break
-
-    return PointCloud(
-        coordinates=best_coordinates,
-        target_coordinates=best_target,
-        metadata={
-            "image_type": "tight_spacing_random_microscope_image",
-            "sampled_nearest_neighbor_spacing": float(spacing),
-            "sampled_spacing_jitter_fraction": float(spacing_jitter_fraction),
-            "visible_atom_count": int(len(best_target)),
-            "rendered_atom_count": int(len(best_coordinates)),
         },
     )
 
@@ -777,14 +650,103 @@ def sample_structure_points(
     )
 
 
+def point_cloud_from_atoms(
+    atoms: Any,
+    image_shape: Tuple[int, int],
+    *,
+    species_intensity_power: float = 1.45,
+    intensity_range: Tuple[float, float] = (0.3, 1.0),
+    atom_sigma_range: Optional[Tuple[float, float]] = None,
+    coordinate_scale: float = 1.0,
+) -> PointCloud:
+    """Convert an ASE Atoms object with x/y positions into renderer-ready points."""
+
+    positions = np.asarray(atoms.get_positions(), dtype=np.float32)
+    if positions.ndim != 2 or positions.shape[1] < 2:
+        raise ValueError("Expected atoms positions with at least x/y columns.")
+
+    atomic_numbers = np.asarray(atoms.get_atomic_numbers(), dtype=np.float32)
+    if len(positions) != len(atomic_numbers):
+        raise ValueError("Atom positions and atomic numbers have different lengths.")
+
+    coordinates = (positions[:, [1, 0]] * float(coordinate_scale)).astype(np.float32)
+    visible = _in_frame_mask(coordinates, image_shape)
+
+    z_weights = atomic_numbers**float(species_intensity_power)
+    weight_min, weight_max = float(z_weights.min()), float(z_weights.max())
+    if weight_max > weight_min:
+        normalized = (z_weights - weight_min) / (weight_max - weight_min)
+    else:
+        normalized = np.ones_like(z_weights, dtype=np.float32)
+
+    intensity_low, intensity_high = intensity_range
+    intensities = (
+        float(intensity_low) + normalized * float(intensity_high - intensity_low)
+    ).astype(np.float32)
+
+    sigmas = None
+    if atom_sigma_range is not None:
+        sigma_low, sigma_high = atom_sigma_range
+        sigmas = (
+            float(sigma_low) + normalized * float(sigma_high - sigma_low)
+        ).astype(np.float32)
+
+    symbols = (
+        atoms.get_chemical_symbols()
+        if hasattr(atoms, "get_chemical_symbols")
+        else [str(int(value)) for value in atomic_numbers]
+    )
+    return PointCloud(
+        coordinates=coordinates,
+        target_coordinates=coordinates[visible].astype(np.float32),
+        intensities=intensities,
+        sigmas=sigmas,
+        metadata={
+            "image_type": "ase_atoms",
+            "atomic_numbers": atomic_numbers.astype(np.int32),
+            "symbols": list(symbols),
+            "visible_atom_count": int(visible.sum()),
+            "rendered_atom_count": int(len(coordinates)),
+        },
+    )
+
+
+def generate_atoms_image(
+    atoms: Any,
+    config: ImageFormationConfig,
+    rng: Optional[np.random.Generator] = None,
+    *,
+    species_intensity_power: float = 1.45,
+    atom_sigma_range: Optional[Tuple[float, float]] = None,
+    coordinate_scale: float = 1.0,
+) -> Dict[str, Any]:
+    """Render a user-constructed ASE Atoms object through the shared image model."""
+
+    points = point_cloud_from_atoms(
+        atoms,
+        config.image_shape,
+        species_intensity_power=species_intensity_power,
+        intensity_range=config.intensity_range,
+        atom_sigma_range=atom_sigma_range,
+        coordinate_scale=coordinate_scale,
+    )
+    return render_atom_image(
+        points.coordinates,
+        config,
+        rng,
+        intensities=points.intensities,
+        sigmas=points.sigmas,
+        target_coordinates=points.target_coordinates,
+        metadata=points.metadata,
+    )
+
+
 def point_cloud_from_config(
     config: ImageFormationConfig,
     rng: Optional[np.random.Generator] = None,
 ) -> PointCloud:
-    if isinstance(config, RandomMicroscopeImageConfig):
-        return sample_random_points(config, rng)
-    if isinstance(config, TightSpacingRandomMicroscopeImageConfig):
-        return sample_tight_spacing_random_points(config, rng)
+    if isinstance(config, RandomAtomImageConfig):
+        return sample_random_atom_points(config, rng)
     if isinstance(config, PeriodicLatticeConfig):
         return sample_lattice_points(config, rng)
     if isinstance(config, AseStructureProjectionConfig):
@@ -792,7 +754,7 @@ def point_cloud_from_config(
     raise TypeError(f"Unsupported synthetic config: {type(config).__name__}")
 
 
-def render_microscope_image(
+def render_atom_image(
     coordinates: np.ndarray,
     config: ImageFormationConfig,
     rng: Optional[np.random.Generator] = None,
@@ -900,16 +862,16 @@ def render_microscope_image(
     return image_record
 
 
-def generate_microscope_image(
+def generate_atom_image(
     config: Optional[ImageFormationConfig] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, Any]:
     """Generate points from the config, then render them through the shared image model."""
 
-    config = config or RandomMicroscopeImageConfig()
+    config = config or RandomAtomImageConfig()
     rng = _as_rng(rng)
     points = point_cloud_from_config(config, rng)
-    return render_microscope_image(
+    return render_atom_image(
         points.coordinates,
         config,
         rng,
@@ -920,8 +882,8 @@ def generate_microscope_image(
     )
 
 
-class SyntheticMicroscopeDataset(Dataset):
-    """Torch dataset wrapper around `generate_microscope_image`."""
+class GeneratedAtomImageDataset(Dataset):
+    """Generate atom image/target pairs on demand."""
 
     def __init__(
         self,
@@ -931,7 +893,7 @@ class SyntheticMicroscopeDataset(Dataset):
         return_metadata: bool = False,
     ) -> None:
         self.num_samples = int(num_samples)
-        self.config = config or RandomMicroscopeImageConfig()
+        self.config = config or RandomAtomImageConfig()
         self.seed = seed
         self.return_metadata = return_metadata
 
@@ -944,7 +906,7 @@ class SyntheticMicroscopeDataset(Dataset):
         return np.random.default_rng(self.seed + idx)
 
     def __getitem__(self, idx: int):
-        image_record = generate_microscope_image(self.config, self._rng_for_index(idx))
+        image_record = generate_atom_image(self.config, self._rng_for_index(idx))
         image = torch.from_numpy(image_record["image"]).unsqueeze(0)
         target = torch.from_numpy(image_record["target"]).unsqueeze(0)
         if not self.return_metadata:
@@ -958,8 +920,8 @@ class SyntheticMicroscopeDataset(Dataset):
         return image, target, metadata
 
 
-class SavedMicroscopeDataset(Dataset):
-    """Load image/target pairs written by ``save_microscope_dataset``."""
+class SavedAtomImageDataset(Dataset):
+    """Load saved atom image/target NPZ samples."""
 
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory)
@@ -984,106 +946,21 @@ def metadata_collate(batch):
     return images, targets, metadata
 
 
-def _loader(dataset: Dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        persistent_workers=num_workers > 0,
-        collate_fn=metadata_collate if getattr(dataset, "return_metadata", False) else None,
-    )
-
-
-def build_synthetic_dataloaders(
-    config: Optional[RandomMicroscopeImageConfig] = None,
-    train_samples: int = 4_000,
-    val_samples: int = 800,
-    test_samples: int = 800,
-    batch_size: int = 8,
-    num_workers: int = 0,
-    seed: int = 0,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    config = config or RandomMicroscopeImageConfig()
-    train = SyntheticMicroscopeDataset(train_samples, config, seed, return_metadata=False)
-    val = SyntheticMicroscopeDataset(val_samples, config, seed + 100_000, return_metadata=False)
-    test = SyntheticMicroscopeDataset(test_samples, config, seed + 200_000, return_metadata=True)
-    return (
-        _loader(train, batch_size, num_workers, shuffle=True),
-        _loader(val, batch_size, num_workers, shuffle=False),
-        _loader(test, batch_size, num_workers, shuffle=False),
-    )
-
-
-def build_generalization_dataloaders(
-    microscope_config: Optional[RandomMicroscopeImageConfig] = None,
-    cubic_config: Optional[PeriodicLatticeConfig] = None,
-    hexagonal_config: Optional[PeriodicLatticeConfig] = None,
-    structure_configs: Optional[Dict[str, AseStructureProjectionConfig]] = None,
-    train_samples: int = 4_000,
-    val_samples: int = 800,
-    random_test_samples: int = 800,
-    periodic_test_samples: int = 800,
-    structure_test_samples: int = 0,
-    batch_size: int = 8,
-    num_workers: int = 0,
-    seed: int = 0,
-) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
-    microscope_config = microscope_config or RandomMicroscopeImageConfig()
-    image_settings = _image_settings_from(microscope_config)
-    cubic_config = cubic_config or PeriodicLatticeConfig(
-        **{**image_settings, "lattice_type": "cubic"}
-    )
-    hexagonal_config = hexagonal_config or PeriodicLatticeConfig(
-        **{**image_settings, "lattice_type": "hexagonal"}
-    )
-
-    train_loader, val_loader, _ = build_synthetic_dataloaders(
-        microscope_config,
-        train_samples=train_samples,
-        val_samples=val_samples,
-        test_samples=1,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        seed=seed,
-    )
-    test_configs: Dict[str, ImageFormationConfig] = {
-        "random": microscope_config,
-        "cubic": cubic_config,
-        "hexagonal": hexagonal_config,
-    }
-    if structure_configs:
-        test_configs.update(structure_configs)
-
-    test_loaders = {}
-    for index, (name, config) in enumerate(test_configs.items()):
-        samples = structure_test_samples if isinstance(config, AseStructureProjectionConfig) else (
-            random_test_samples if name == "random" else periodic_test_samples
-        )
-        test_loaders[name] = _loader(
-            SyntheticMicroscopeDataset(samples, config, seed + 200_000 + index * 100_000, True),
-            batch_size,
-            num_workers,
-            shuffle=False,
-        )
-    return train_loader, val_loader, test_loaders
-
-
-def save_microscope_dataset(
+def generate_and_save_samples(
     output_dir: str | Path,
     num_samples: int,
     config: Optional[ImageFormationConfig] = None,
     seed: int = 0,
     prefix: str = "image",
 ) -> List[Path]:
-    """Save a generated random dataset as one NPZ file per image."""
+    """Generate atom image samples and save one NPZ file per sample."""
 
-    config = config or RandomMicroscopeImageConfig()
+    config = config or RandomAtomImageConfig()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: List[Path] = []
     for idx in range(num_samples):
-        image_record = generate_microscope_image(config, np.random.default_rng(seed + idx))
+        image_record = generate_atom_image(config, np.random.default_rng(seed + idx))
         file_path = output_dir / f"{prefix}_{idx:05d}.npz"
         np.savez_compressed(
             file_path,
@@ -1101,7 +978,7 @@ def save_microscope_dataset(
     return paths
 
 
-def save_microscope_dataset_splits(
+def generate_and_save_dataset_splits(
     output_dir: str | Path,
     train_samples: int,
     val_samples: int,
@@ -1110,81 +987,13 @@ def save_microscope_dataset_splits(
     seed: int = 0,
     prefix: str = "image",
 ) -> Dict[str, List[Path]]:
-    config = config or RandomMicroscopeImageConfig()
+    config = config or RandomAtomImageConfig()
     split_specs = [
         ("train", int(train_samples), seed),
         ("val", int(val_samples), seed + 1_000_000),
         ("test", int(test_samples), seed + 2_000_000),
     ]
     return {
-        split: save_microscope_dataset(Path(output_dir) / split, count, config, split_seed, prefix)
+        split: generate_and_save_samples(Path(output_dir) / split, count, config, split_seed, prefix)
         for split, count, split_seed in split_specs
     }
-
-
-def plot_microscope_image(
-    image_record: Dict[str, Any],
-    figsize: Tuple[float, float] = (12.0, 4.0),
-):
-    import matplotlib.pyplot as plt
-
-    image = image_record["image"]
-    target = image_record["target"]
-    coordinates = np.asarray(image_record["coordinates"])
-    fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
-    axes[0].imshow(image, cmap="gray")
-    axes[0].set_title("Input")
-    axes[1].imshow(target, cmap="magma")
-    axes[1].set_title("Target Heatmap")
-    axes[2].imshow(image, cmap="gray")
-    if len(coordinates):
-        axes[2].scatter(
-            coordinates[:, 1],
-            coordinates[:, 0],
-            s=20,
-            c="cyan",
-            edgecolors="black",
-            linewidths=0.5,
-        )
-    axes[2].set_title("Atom Centers")
-    for ax in axes:
-        ax.axis("off")
-    return fig, axes
-
-
-def save_microscope_preview(
-    image_record: Dict[str, Any],
-    output_path: str | Path,
-    scale: int = 3,
-    separator: int = 6,
-) -> Path:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    image = np.clip(image_record["image"], 0.0, 1.0)
-    target = np.clip(image_record["target"], 0.0, 1.0)
-    coordinates = np.asarray(image_record["coordinates"], dtype=np.float32)
-    input_panel = np.stack([image, image, image], axis=-1)
-    target_panel = np.stack([target, target, target], axis=-1)
-    overlay_panel = input_panel.copy()
-
-    overlay_image = Image.fromarray((overlay_panel * 255).astype(np.uint8), mode="RGB")
-    draw = ImageDraw.Draw(overlay_image)
-    for y, x in coordinates:
-        draw.ellipse((x - 2, y - 2, x + 2, y + 2), outline=(0, 255, 255), width=1)
-    overlay_panel = np.asarray(overlay_image, dtype=np.uint8) / 255.0
-
-    height, width = image.shape
-    preview = np.ones((height, width * 3 + separator * 2, 3), dtype=np.float32)
-    preview[:, :width] = input_panel
-    preview[:, width + separator : 2 * width + separator] = target_panel
-    preview[:, 2 * width + 2 * separator :] = overlay_panel
-
-    preview_image = Image.fromarray((preview * 255).astype(np.uint8), mode="RGB")
-    if scale > 1:
-        preview_image = preview_image.resize(
-            (preview_image.width * scale, preview_image.height * scale),
-            resample=RESAMPLE_NEAREST,
-        )
-    preview_image.save(output_path)
-    return output_path

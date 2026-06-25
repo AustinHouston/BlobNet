@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 from blobnet.loss_func import CombinedGaussianLoss
 from blobnet.networks import build_unet
-from blobnet.synthetic import SavedMicroscopeDataset
+from blobnet.synthetic import SavedAtomImageDataset
 
 
 def train_model(
@@ -148,7 +148,7 @@ def train_model(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Train BlobNet U-Net from a saved NPZ dataset.')
-    parser.add_argument('--config', type=Path, default=Path('configs/model_configs/unet.yaml'))
+    parser.add_argument('--config', type=Path, default=Path('configs/model_configs/base_unet.yaml'))
     parser.add_argument('--dataset-dir', type=Path)
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--epochs', type=int)
@@ -183,7 +183,7 @@ def main() -> int:
     else:
         device = torch.device('cpu')
     print(f'Using device: {device}', flush=True)
-    datasets = {split: SavedMicroscopeDataset(dataset_dir / split) for split in ('train', 'val', 'test')}
+    datasets = {split: SavedAtomImageDataset(dataset_dir / split) for split in ('train', 'val', 'test')}
     loaders = {
         split: DataLoader(
             dataset,

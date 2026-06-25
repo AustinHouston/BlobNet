@@ -1,0 +1,60 @@
+dataset:
+  # Human-readable dataset label copied into dataset_manifest.yaml.
+  name: random_2026_06_24a
+  # Generator family. "random" samples non-periodic atom positions with a minimum spacing.
+  type: random
+  # Directory where train/, val/, test/, and dataset_manifest.yaml are written.
+  output_dir: outputs/datasets/random_2026_06_24a
+  # Base random seed. Validation and test splits use deterministic offsets from this seed.
+  seed: 0
+  # Filename prefix for saved NPZ samples, e.g. sample_00000.npz.
+  prefix: sample
+  # Number of generated samples per split.
+  splits:
+    train: 1024
+    val: 256
+    test: 256
+
+parameters:
+  # Output image size as [height, width] in pixels.
+  image_shape: [512, 512]
+  # Minimum number of visible atom centers requested per image.
+  min_atoms: 200
+  # Maximum number of visible atom centers requested per image.
+  max_atoms: 400
+  # Fallback minimum center-to-center atom spacing in pixels.
+  min_separation: 12.5
+  # Per-image random range for minimum atom spacing in pixels; overrides min_separation when set.
+  min_separation_range: [9.0, 15.0]
+  # Per-atom Gaussian width range in pixels; larger values make atom blobs wider.
+  sigma_range: [1.4, 3.0]
+  # Per-atom brightness range before noise and normalization.
+  intensity_range: [0.1, 1.0]
+  # Gaussian width in pixels for the ground-truth target heatmap peaks.
+  target_sigma: 2
+  # Constant background intensity sampled per image before normalization.
+  background_range: [0.05, 0.5]
+  # Linear y and x gradient strength ranges; nonzero values add ramp-like background.
+  gradient_range: [-0.1, 0.1]
+  # Smooth background-field amplitude; higher values make broad uneven illumination stronger.
+  inhomogeneous_background_range: [0.05, 0.15]
+  # Smooth background correlation length as a fraction of image size; larger values vary more slowly.
+  inhomogeneous_background_sigma_fraction_range: [0.18, 0.45]
+  # Low-frequency random noise amplitude before Poisson/read noise.
+  low_frequency_noise_range: [0.05, 0.25]
+  # Low-frequency noise blur scale as a fraction of image size.
+  low_frequency_sigma_fraction_range: [0.05, 0.15]
+  # Additive Gaussian read-noise standard deviation after Poisson sampling.
+  read_noise_std_range: [0.05, 0.2]
+  # Total Poisson count scale per image; lower values produce stronger shot noise.
+  total_counts_range: [50.0, 25000.0]
+  # Alternative to total_counts_range: counts per pixel. Must be null when total_counts_range is set.
+  counts_per_pixel_range: null
+  # Image blur sigma range in pixels applied before count sampling.
+  blur_sigma_range: [0.1, 1.0]
+  # Extra off-frame rendering margin in pixels so atoms can partially enter at image edges.
+  edge_padding: 16
+  # Normalize each final input image to [0, 1].
+  normalize_input: true
+  # Clip target heatmap values to [0, 1].
+  clamp_target: true

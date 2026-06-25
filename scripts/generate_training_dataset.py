@@ -9,15 +9,13 @@ import yaml
 from blobnet.synthetic import (
     AseStructureProjectionConfig,
     PeriodicLatticeConfig,
-    RandomMicroscopeImageConfig,
-    TightSpacingRandomMicroscopeImageConfig,
-    save_microscope_dataset_splits,
+    RandomAtomImageConfig,
+    generate_and_save_dataset_splits,
 )
 
 
 CONFIG_TYPES = {
-    'random': RandomMicroscopeImageConfig,
-    'tight_spacing_random': TightSpacingRandomMicroscopeImageConfig,
+    'random': RandomAtomImageConfig,
     'periodic_lattice': PeriodicLatticeConfig,
     'ase_structure': AseStructureProjectionConfig,
 }
@@ -25,7 +23,7 @@ CONFIG_TYPES = {
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Generate and save a BlobNet training dataset from YAML.')
-    parser.add_argument('--config', type=Path, default=Path('configs/dataset_configs/random_2026_06_24a.yaml'))
+    parser.add_argument('--config', type=Path, default=Path('configs/dataset_configs/random.yaml'))
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--train-samples', type=int)
     parser.add_argument('--val-samples', type=int)
@@ -53,7 +51,7 @@ def main() -> int:
         path.unlink()
 
     image_config = CONFIG_TYPES[dataset_type](**raw_config['parameters'])
-    saved = save_microscope_dataset_splits(
+    saved = generate_and_save_dataset_splits(
         output_dir,
         train_samples=split_counts['train'],
         val_samples=split_counts['val'],
