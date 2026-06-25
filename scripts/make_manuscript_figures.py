@@ -553,6 +553,65 @@ def _read_sweep_rows(csv_path: Path) -> list[dict[str, float]]:
         return rows
 
 
+def _generate_missing_sweep_csv(args: argparse.Namespace) -> None:
+    if args.sweep_csv.exists():
+        return
+    if args.sweep_csv.name != 'pixel_size_metrics.csv':
+        raise FileNotFoundError(
+            f'Missing sweep CSV: {args.sweep_csv}. Automatic sweep generation expects '
+            "the output filename to be 'pixel_size_metrics.csv'."
+        )
+
+    from scripts.run_pixel_size_sweep import DEFAULT_PIXEL_SIZE_FACTORS, DEFAULT_THRESHOLD_GRID, generate_pixel_size_sweep
+
+    sweep_args = argparse.Namespace(
+        output_dir=args.sweep_csv.parent,
+        checkpoint=args.checkpoint,
+        device=args.device,
+        seed=getattr(args, 'seed', 0),
+        samples_per_size=args.sweep_samples,
+        batch_size=args.batch_size,
+        num_workers=0,
+        height=256,
+        width=256,
+        train_pixel_size_angstrom=0.1062231596676199,
+        pixel_size_factors=DEFAULT_PIXEL_SIZE_FACTORS,
+        pixel_sizes_angstrom=None,
+        num_filters=args.num_filters,
+        dropout=args.dropout,
+        train_sigma_min=2.8,
+        train_sigma_max=4.3,
+        train_target_sigma=0.9,
+        train_min_separation_range_min=12.5,
+        train_min_separation_range_max=16.7,
+        min_atoms=80,
+        max_atoms=180,
+        background_min=0.0,
+        background_max=0.3,
+        inhom_background_min=0.0,
+        inhom_background_max=0.16,
+        low_freq_noise_min=0.05,
+        low_freq_noise_max=0.28,
+        read_noise_min=0.02,
+        read_noise_max=0.12,
+        total_counts_min=50.0,
+        total_counts_max=25000.0,
+        blur_sigma_min=0.2,
+        blur_sigma_max=1.1,
+        edge_padding=16,
+        threshold_grid=DEFAULT_THRESHOLD_GRID,
+        train_match_distance=3.0,
+        train_peak_min_distance=3,
+        train_peak_window_size=5,
+        fixed_evaluation_pixels=False,
+        example_size_count=None,
+    )
+    print(f'Missing sweep CSV; generating pixel-size sweep at {args.sweep_csv.parent}', flush=True)
+    generated_path = generate_pixel_size_sweep(sweep_args)
+    if generated_path != args.sweep_csv:
+        raise FileNotFoundError(f'Expected sweep CSV at {args.sweep_csv}, generated {generated_path}')
+
+
 def _training_pixel_size(rows: list[dict[str, float]]) -> float:
     by_factor = min(rows, key=lambda row: abs(row.get('pixel_size_factor', 0.0) - 1.0))
     return float(by_factor['pixel_size_angstrom'])
@@ -605,6 +664,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
     model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
+    _generate_missing_sweep_csv(args)
     rows = _read_sweep_rows(args.sweep_csv)
     spacing_image = _spacing_variation_image()
     size_image = _size_variation_image()
@@ -691,6 +751,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(figure3)
     figure3.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     figure3.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
+    figure3.add_argument('--sweep-samples', type=int, default=64)
+    figure3.add_argument('--batch-size', type=int, default=8)
     figure3.set_defaults(func=make_figure_3)
 
     all_parser = subparsers.add_parser('all', help='Build all three figures.')
@@ -702,6 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     all_parser.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     all_parser.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
+    all_parser.add_argument('--sweep-samples', type=int, default=64)
     all_parser.add_argument('--seed', type=int, default=0)
     all_parser.add_argument('--offset-samples', type=int, default=32)
     all_parser.add_argument('--batch-size', type=int, default=4)

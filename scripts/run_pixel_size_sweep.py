@@ -320,8 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def generate_pixel_size_sweep(args: argparse.Namespace) -> Path:
     if args.samples_per_size <= 0:
         raise ValueError('--samples-per-size must be greater than zero.')
     if not args.threshold_grid:
@@ -368,7 +367,12 @@ def main() -> int:
     (args.output_dir / 'pixel_size_sweep_config.json').write_text(json.dumps(config_json, indent=2))
     _save_accuracy_plot(args.output_dir / 'pixel_size_accuracy_vs_feature_rf.png', rows)
     _save_example_gallery(args.output_dir / 'pixel_size_target_output_examples.png', rows, examples, args.example_size_count)
-    print(args.output_dir / 'pixel_size_metrics.csv')
+    return args.output_dir / 'pixel_size_metrics.csv'
+
+
+def main() -> int:
+    output_path = generate_pixel_size_sweep(build_parser().parse_args())
+    print(output_path)
     return 0
 
 
