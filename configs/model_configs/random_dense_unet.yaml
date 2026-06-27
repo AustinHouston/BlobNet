@@ -1,0 +1,27 @@
+dataset:
+  path: outputs/datasets/random_dense_2026_06_26a
+
+model:
+  input_channels: 1
+  output_channels: 1
+  filters: [32, 64, 128, 256]
+  dropout: 0.2
+
+loss:
+  mse_weight: 0.5
+  peak_weight: 0.5
+  threshold: 0.1
+  peak_boost: 5.0
+  from_logits: true
+
+training:
+  output_dir: outputs/manuscript_models/random_dense
+  epochs: 20
+  batch_size: 32
+  learning_rate: 0.001
+  device: cuda
+  num_workers: 0
+  seed: 0
+  progress_interval: null
+  early_stopping_patience: 6
+  early_stopping_min_delta: 0.0005

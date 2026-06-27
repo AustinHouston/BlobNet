@@ -1,0 +1,41 @@
+dataset:
+  name: random_measured_2026_06_26a
+  type: random
+  output_dir: outputs/datasets/random_measured_2026_06_26a
+  seed: 0
+  prefix: sample
+  splits:
+    train: 1024
+    val: 256
+    test: 256
+
+parameters:
+  image_shape: [512, 512]
+  # Experimental blob-finder measurements gave sigma ~= 2.6-3.2 px.
+  # Use the same spacing prior as the square/hexagonal measured datasets for
+  # an apples-to-apples comparison.
+  min_atoms: 550
+  max_atoms: 900
+  min_separation: 15.5
+  min_separation_range: [13.0, 18.0]
+  subpixel_jitter_range: [0.5, 0.5]
+  sampling_mode: poisson_disk
+  relaxation_iterations: 0
+  relaxation_strength: 0.0
+  relaxation_noise: 0.0
+  sigma_range: [2.6, 3.2]
+  intensity_range: [0.1, 1.0]
+  target_sigma: 2
+  background_range: [0.05, 0.5]
+  gradient_range: [-0.1, 0.1]
+  inhomogeneous_background_range: [0.05, 0.15]
+  inhomogeneous_background_sigma_fraction_range: [0.18, 0.45]
+  low_frequency_noise_range: [0.05, 0.25]
+  low_frequency_sigma_fraction_range: [0.05, 0.15]
+  read_noise_std_range: [0.05, 0.2]
+  total_counts_range: [50.0, 25000.0]
+  counts_per_pixel_range: null
+  blur_sigma_range: [0.1, 1.0]
+  edge_padding: 16
+  normalize_input: true
+  clamp_target: true

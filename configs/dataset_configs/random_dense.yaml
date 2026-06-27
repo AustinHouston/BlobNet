@@ -1,0 +1,68 @@
+dataset:
+  # Human-readable dataset label copied into dataset_manifest.yaml.
+  name: random_dense_2026_06_26a
+  # Generator family. "random" samples non-periodic atom positions.
+  type: random
+  # Directory where train/, val/, test/, and dataset_manifest.yaml are written.
+  output_dir: outputs/datasets/random_dense_2026_06_26a
+  # Base random seed. Validation and test splits use deterministic offsets from this seed.
+  seed: 0
+  # Filename prefix for saved NPZ samples, e.g. sample_00000.npz.
+  prefix: sample
+  # Number of generated samples per split.
+  splits:
+    train: 1024
+    val: 256
+    test: 256
+
+parameters:
+  # Output image size as [height, width] in pixels.
+  image_shape: [512, 512]
+  # Dense random images deliberately request more atoms than the Poisson-disk
+  # random set. Density is controlled directly through these counts.
+  min_atoms: 2400
+  max_atoms: 3000
+  # Soft center-to-center repulsion scale in pixels for relaxed_dense sampling.
+  min_separation: 8.5
+  # Per-image range for the soft repulsion scale; smaller values allow denser/clumpier fields.
+  min_separation_range: [7.0, 10.0]
+  # Per-image maximum absolute x/y subpixel jitter in pixels after candidate placement.
+  subpixel_jitter_range: [0.5, 0.5]
+  # Use vectorized KD-tree relaxation instead of hard Poisson-disk rejection.
+  sampling_mode: relaxed_dense
+  # Small iteration counts are intended for large dataset generation.
+  relaxation_iterations: 8
+  relaxation_strength: 0.45
+  relaxation_noise: 0.05
+  # Per-atom Gaussian width range in pixels; larger values make atom blobs wider.
+  sigma_range: [1.2, 2.6]
+  # Per-atom brightness range before noise and normalization.
+  intensity_range: [0.1, 1.0]
+  # Gaussian width in pixels for the ground-truth target heatmap peaks.
+  target_sigma: 2
+  # Constant background intensity sampled per image before normalization.
+  background_range: [0.05, 0.5]
+  # Linear y and x gradient strength ranges; nonzero values add ramp-like background.
+  gradient_range: [-0.1, 0.1]
+  # Smooth background-field amplitude; higher values make broad uneven illumination stronger.
+  inhomogeneous_background_range: [0.05, 0.15]
+  # Smooth background correlation length as a fraction of image size; larger values vary more slowly.
+  inhomogeneous_background_sigma_fraction_range: [0.18, 0.45]
+  # Low-frequency random noise amplitude before Poisson/read noise.
+  low_frequency_noise_range: [0.05, 0.25]
+  # Low-frequency noise blur scale as a fraction of image size.
+  low_frequency_sigma_fraction_range: [0.05, 0.15]
+  # Additive Gaussian read-noise standard deviation after Poisson sampling.
+  read_noise_std_range: [0.05, 0.2]
+  # Total Poisson count scale per image; lower values produce stronger shot noise.
+  total_counts_range: [50.0, 25000.0]
+  # Alternative to total_counts_range: counts per pixel. Must be null when total_counts_range is set.
+  counts_per_pixel_range: null
+  # Image blur sigma range in pixels applied before count sampling.
+  blur_sigma_range: [0.1, 1.0]
+  # Extra off-frame rendering margin in pixels so atoms can partially enter at image edges.
+  edge_padding: 16
+  # Normalize each final input image to [0, 1].
+  normalize_input: true
+  # Clip target heatmap values to [0, 1].
+  clamp_target: true

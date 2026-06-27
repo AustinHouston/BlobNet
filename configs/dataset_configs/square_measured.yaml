@@ -1,0 +1,37 @@
+dataset:
+  name: square_measured_2026_06_26a
+  type: periodic_lattice
+  output_dir: outputs/datasets/square_measured_2026_06_26a
+  seed: 0
+  prefix: sample
+  splits:
+    train: 1024
+    val: 256
+    test: 256
+
+parameters:
+  image_shape: [512, 512]
+  lattice_type: cubic
+  # Main experimental nearest-neighbor mode from WS2/TwinsOverview.
+  lattice_spacing_range: [13.0, 18.0]
+  rotation_range: [0.0, 180.0]
+  jitter_std_range: [0.0, 0.25]
+  vacancy_fraction_range: [0.0, 0.03]
+  min_atoms: 200
+  # Experimental blob-finder measurements gave sigma ~= 2.6-3.2 px.
+  sigma_range: [2.6, 3.2]
+  intensity_range: [0.1, 1.0]
+  target_sigma: 2
+  background_range: [0.05, 0.5]
+  gradient_range: [-0.1, 0.1]
+  inhomogeneous_background_range: [0.05, 0.15]
+  inhomogeneous_background_sigma_fraction_range: [0.18, 0.45]
+  low_frequency_noise_range: [0.05, 0.25]
+  low_frequency_sigma_fraction_range: [0.05, 0.15]
+  read_noise_std_range: [0.05, 0.2]
+  total_counts_range: [50.0, 25000.0]
+  counts_per_pixel_range: null
+  blur_sigma_range: [0.1, 1.0]
+  edge_padding: 16
+  normalize_input: true
+  clamp_target: true

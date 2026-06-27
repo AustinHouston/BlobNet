@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.spatial import cKDTree
 import torch
 from scipy.ndimage import gaussian_filter
 from torch.utils.data import Dataset
@@ -46,6 +47,10 @@ class RandomAtomImageConfig(ImageFormationConfig):
     min_separation: float = 4.0
     min_separation_range: Optional[Tuple[float, float]] = None
     subpixel_jitter_range: Tuple[float, float] = (0.0, 0.0)
+    sampling_mode: str = "poisson_disk"
+    relaxation_iterations: int = 0
+    relaxation_strength: float = 0.45
+    relaxation_noise: float = 0.08
 
 
 @dataclass(frozen=True)
@@ -385,6 +390,74 @@ def sample_atom_coordinates(
     return np.stack(coordinates, axis=0).astype(np.float32)
 
 
+def _sample_relaxed_dense_coordinates(
+    config: RandomAtomImageConfig,
+    rng: np.random.Generator,
+    atom_count: int,
+    soft_min_separation: float,
+    boundary_margin: Optional[float] = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    height, width = config.image_shape
+    margin = (
+        float(boundary_margin)
+        if boundary_margin is not None
+        else max(0.0, _support_margin_for_sigma(config.sigma_range))
+    )
+    y_min, y_max, x_min, x_max = _valid_sampling_bounds((height, width), margin)
+    coordinates = np.column_stack(
+        [
+            rng.uniform(y_min, y_max, size=int(atom_count)),
+            rng.uniform(x_min, x_max, size=int(atom_count)),
+        ]
+    ).astype(np.float32)
+
+    iterations = max(0, int(config.relaxation_iterations))
+    soft_distance = max(float(soft_min_separation), 1e-6)
+    strength = max(0.0, float(config.relaxation_strength))
+    noise_scale = max(0.0, float(config.relaxation_noise))
+
+    for iteration in range(iterations):
+        tree = cKDTree(coordinates)
+        pairs = np.asarray(list(tree.query_pairs(soft_distance)), dtype=np.int32)
+        if pairs.size == 0:
+            break
+
+        deltas = coordinates[pairs[:, 0]] - coordinates[pairs[:, 1]]
+        distances = np.linalg.norm(deltas, axis=1)
+        safe_distances = np.maximum(distances, 1e-6)
+        overlaps = (soft_distance - distances) / soft_distance
+        unit = deltas / safe_distances[:, None]
+        step_scale = 0.5 * strength * overlaps[:, None] * soft_distance
+        displacements = unit * step_scale
+        update = np.zeros_like(coordinates)
+        np.add.at(update, pairs[:, 0], displacements)
+        np.add.at(update, pairs[:, 1], -displacements)
+
+        temperature = noise_scale * soft_distance * (1.0 - (iteration / max(iterations, 1)))
+        if temperature > 0:
+            update += rng.normal(0.0, temperature, size=coordinates.shape).astype(np.float32)
+
+        max_step = max(0.25 * soft_distance, 1e-6)
+        step_norms = np.linalg.norm(update, axis=1)
+        too_large = step_norms > max_step
+        if np.any(too_large):
+            update[too_large] *= (max_step / step_norms[too_large])[:, None]
+        coordinates += update.astype(np.float32)
+        coordinates[:, 0] = np.clip(coordinates[:, 0], y_min, np.nextafter(y_max, y_min))
+        coordinates[:, 1] = np.clip(coordinates[:, 1], x_min, np.nextafter(x_max, x_min))
+
+    tree = cKDTree(coordinates)
+    nearest_distances = tree.query(coordinates, k=min(2, len(coordinates)))[0]
+    nearest = nearest_distances[:, 1] if nearest_distances.ndim == 2 and nearest_distances.shape[1] > 1 else np.zeros((len(coordinates),), dtype=np.float32)
+    metadata = {
+        "relaxed_nearest_min": float(np.min(nearest)) if len(nearest) else 0.0,
+        "relaxed_nearest_median": float(np.median(nearest)) if len(nearest) else 0.0,
+        "relaxed_nearest_mean": float(np.mean(nearest)) if len(nearest) else 0.0,
+        "relaxed_density_atoms_per_pixel": float(len(coordinates) / max((y_max - y_min) * (x_max - x_min), 1.0)),
+    }
+    return coordinates.astype(np.float32), metadata
+
+
 def sample_random_atom_points(
     config: RandomAtomImageConfig,
     rng: Optional[np.random.Generator] = None,
@@ -397,11 +470,23 @@ def sample_random_atom_points(
     )
     desired_visible_count = int(rng.integers(config.min_atoms, config.max_atoms + 1))
     padding = max(0, int(config.edge_padding))
+    sampling_mode = str(config.sampling_mode).lower()
+    relaxation_metadata: dict[str, float] = {}
 
     if padding <= 0:
-        coordinates = sample_atom_coordinates(
-            config, rng, atom_count=desired_visible_count, min_separation=min_separation
-        )
+        if sampling_mode == "poisson_disk":
+            coordinates = sample_atom_coordinates(
+                config, rng, atom_count=desired_visible_count, min_separation=min_separation
+            )
+        elif sampling_mode == "relaxed_dense":
+            coordinates, relaxation_metadata = _sample_relaxed_dense_coordinates(
+                config,
+                rng,
+                atom_count=desired_visible_count,
+                soft_min_separation=min_separation,
+            )
+        else:
+            raise ValueError("RandomAtomImageConfig.sampling_mode must be 'poisson_disk' or 'relaxed_dense'.")
         subpixel_jitter = 0.0
         target_coordinates = coordinates
     else:
@@ -422,13 +507,25 @@ def sample_random_atom_points(
         best_subpixel_jitter = 0.0
 
         for _ in range(2):
-            padded = sample_atom_coordinates(
-                sampling_config,
-                rng,
-                atom_count=total_atom_count,
-                min_separation=min_separation,
-                boundary_margin=boundary_margin,
-            )
+            if sampling_mode == "poisson_disk":
+                padded = sample_atom_coordinates(
+                    sampling_config,
+                    rng,
+                    atom_count=total_atom_count,
+                    min_separation=min_separation,
+                    boundary_margin=boundary_margin,
+                )
+                candidate_metadata: dict[str, float] = {}
+            elif sampling_mode == "relaxed_dense":
+                padded, candidate_metadata = _sample_relaxed_dense_coordinates(
+                    sampling_config,
+                    rng,
+                    atom_count=total_atom_count,
+                    soft_min_separation=min_separation,
+                    boundary_margin=boundary_margin,
+                )
+            else:
+                raise ValueError("RandomAtomImageConfig.sampling_mode must be 'poisson_disk' or 'relaxed_dense'.")
             coordinates = _shift_coordinates(padded, (-padding, -padding))
             subpixel_jitter = 0.0
             coordinates, target_coordinates = _limit_visible_coordinates(
@@ -444,6 +541,7 @@ def sample_random_atom_points(
             if best_score is None or score < best_score:
                 best_coordinates, best_target, best_score = coordinates, target_coordinates, score
                 best_subpixel_jitter = subpixel_jitter
+                relaxation_metadata = candidate_metadata
             if score[0] == 0:
                 break
         coordinates, target_coordinates = best_coordinates, best_target
@@ -458,6 +556,9 @@ def sample_random_atom_points(
             "sampled_subpixel_jitter": float(subpixel_jitter),
             "visible_atom_count": int(len(target_coordinates)),
             "rendered_atom_count": int(len(coordinates)),
+            "sampling_mode": sampling_mode,
+            "relaxation_iterations": int(config.relaxation_iterations),
+            **relaxation_metadata,
         },
     )
 
