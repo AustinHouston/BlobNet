@@ -13,7 +13,7 @@ import h5py
 import numpy as np
 import torch
 import yaml
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, zoom
 from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader
 
@@ -239,6 +239,52 @@ def _load_experimental_image(path: Path) -> np.ndarray:
     return _normalize_image(np.squeeze(image))
 
 
+def _center_crop_or_pad(image: np.ndarray, size: int) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    output = np.zeros((size, size), dtype=np.float32)
+    src_y0 = max((image.shape[0] - size) // 2, 0)
+    src_x0 = max((image.shape[1] - size) // 2, 0)
+    src_y1 = min(src_y0 + size, image.shape[0])
+    src_x1 = min(src_x0 + size, image.shape[1])
+    crop = image[src_y0:src_y1, src_x0:src_x1]
+    dst_y0 = max((size - crop.shape[0]) // 2, 0)
+    dst_x0 = max((size - crop.shape[1]) // 2, 0)
+    output[dst_y0 : dst_y0 + crop.shape[0], dst_x0 : dst_x0 + crop.shape[1]] = crop
+    return output
+
+
+def _read_experimental_feature_measurements(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(f'Missing experimental feature measurements: {path}')
+    payload = json.loads(path.read_text())
+    return {
+        str(record['image']): record
+        for record in payload['images']
+    }
+
+
+def _make_feature_matched_experimental_view(
+    image: np.ndarray,
+    measurement: dict[str, Any],
+    dog_small: float,
+    dog_large: float,
+    target_sigma_px: float,
+    crop_size: int,
+) -> tuple[np.ndarray, dict[str, float]]:
+    dog = gaussian_filter(image, dog_small) - gaussian_filter(image, dog_large)
+    dog = _normalize_image(dog)
+    sigma_px = float(measurement['sigma_px_median'])
+    scale = float(target_sigma_px) / sigma_px
+    scaled = zoom(dog, zoom=scale, order=1, mode='nearest', prefilter=False)
+    view = _center_crop_or_pad(_normalize_image(scaled), int(crop_size))
+    return view, {
+        'feature_match_zoom': scale,
+        'expected_sigma_px': sigma_px * scale,
+        'expected_fwhm_px': float(measurement['fwhm_px_median']) * scale,
+        'expected_spacing_px': float(measurement['spacing_px_median']) * scale,
+    }
+
+
 def _plot_clean_image(ax: plt.Axes, image: np.ndarray, title: str, cmap: str = 'gray') -> None:
     ax.imshow(image, cmap=cmap, vmin=0.0, vmax=1.0)
     if title:
@@ -443,6 +489,7 @@ def make_figure_2(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
     model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
+    measurements = _read_experimental_feature_measurements(args.experimental_measurements)
 
     files = [
         ('WS2 grain boundary', args.data_dir / 'WS2.emd'),
@@ -450,17 +497,24 @@ def make_figure_2(args: argparse.Namespace) -> Path:
         ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
         ('Twins overview', args.data_dir / 'TwinsOverview.emd'),
     ]
-    images: list[tuple[str, np.ndarray]] = []
+    images: list[tuple[str, np.ndarray, dict[str, float]]] = []
     outputs: list[np.ndarray] = []
     for label, path in files:
         image = _load_experimental_image(path)
-        model_input = _normalize_image(gaussian_filter(image, args.dog_small) - gaussian_filter(image, args.dog_large))
+        model_input, transform = _make_feature_matched_experimental_view(
+            image,
+            measurements[path.stem],
+            dog_small=args.dog_small,
+            dog_large=args.dog_large,
+            target_sigma_px=args.feature_match_sigma_px,
+            crop_size=args.experimental_crop_size,
+        )
         prediction = _predict_tiled(model, model_input, device, args.tile_size, args.tile_overlap, args.batch_size)
-        images.append((label, image))
+        images.append((label, model_input, transform))
         outputs.append(prediction)
 
     fig, axes = plt.subplots(2, 4, figsize=(16, 7.2), constrained_layout=True)
-    for col, ((label, image), output) in enumerate(zip(images, outputs)):
+    for col, ((label, image, _transform), output) in enumerate(zip(images, outputs)):
         _plot_clean_image(axes[0, col], image, '', cmap='gray')
         axes[1, col].imshow(output, cmap=MODEL_CMAPS['random'], vmin=0.0, vmax=max(float(output.max()), 1e-6))
         axes[1, col].set_xticks([])
@@ -475,10 +529,13 @@ def make_figure_2(args: argparse.Namespace) -> Path:
             'label': label,
             'shape_y': int(image.shape[0]),
             'shape_x': int(image.shape[1]),
+            'display_processing': 'DoG background-subtracted, feature-sigma matched, center-cropped',
+            'target_sigma_px': float(args.feature_match_sigma_px),
+            **transform,
             'output_mean': float(output.mean()),
             'output_max': float(output.max()),
         }
-        for (label, image), output in zip(images, outputs)
+        for (label, image, transform), output in zip(images, outputs)
     ]
     (output_dir / 'figure2_experimental_haadf_outputs.json').write_text(json.dumps(summary, indent=2))
     return output_path
@@ -544,14 +601,17 @@ def _merge_projected_columns_for_rendering(
     return np.asarray(merged_xy, dtype=np.float32), np.asarray(merged_numbers, dtype=np.int32)
 
 
-def _make_ws2_edge_record(
+def _make_tmd_edge_record(
     shape: tuple[int, int],
     seed: int,
     sigma_range: tuple[float, float],
     total_counts_range: tuple[float, float] = (35.0, 250.0),
+    structure_name: str = 'ws2',
+    quiet_background: bool = False,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
-    unit = build_ase_structure_unit_cell('ws2')
+    structure_name = str(structure_name).lower()
+    unit = build_ase_structure_unit_cell(structure_name)
     repeated = unit.repeat((44, 44, 1))
     positions = np.asarray(repeated.get_positions(), dtype=np.float32)
     numbers = np.asarray(repeated.get_atomic_numbers(), dtype=np.int32)
@@ -562,8 +622,8 @@ def _make_ws2_edge_record(
     theta = np.deg2rad(17.0)
     rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=np.float32)
     xy = xy_angstrom @ rotation.T
-    ws2_pixel_size_angstrom = 0.12
-    xy = xy / ws2_pixel_size_angstrom
+    tmd_pixel_size_angstrom = 0.12
+    xy = xy / tmd_pixel_size_angstrom
     xy[:, 0] += shape[1] * 0.49
     xy[:, 1] += shape[0] * 0.54
 
@@ -592,30 +652,17 @@ def _make_ws2_edge_record(
     coordinates_yx = coordinates_yx[visible]
     numbers = numbers[visible]
 
+    heavy_atomic_number = 42 if structure_name.startswith('mos2') else 74
     weights = numbers.astype(np.float32) ** 1.45
-    weights = (weights - weights.min()) / max(float(weights.max() - weights.min()), 1e-6)
-    intensities = (0.22 + 0.78 * weights).astype(np.float32)
+    intensities = (weights / max(float(weights.max()), 1e-6)).astype(np.float32)
     sigma_min, sigma_max = float(sigma_range[0]), float(sigma_range[1])
-    sigmas = np.where(numbers >= 74, sigma_max, sigma_min).astype(np.float32)
+    sigmas = np.where(numbers >= heavy_atomic_number, sigma_max, sigma_min).astype(np.float32)
 
-    config = ImageFormationConfig(
-        image_shape=shape,
-        sigma_range=(sigma_min, sigma_max),
-        intensity_range=(0.2, 1.0),
-        target_sigma=2.0,
-        background_range=(0.04, 0.32),
-        gradient_range=(-0.08, 0.08),
-        inhomogeneous_background_range=(0.07, 0.18),
-        inhomogeneous_background_sigma_fraction_range=(0.16, 0.42),
-        low_frequency_noise_range=(0.05, 0.20),
-        low_frequency_sigma_fraction_range=(0.05, 0.14),
-        read_noise_std_range=(0.08, 0.22),
+    config = _edge_figure_render_config(
+        shape,
+        (sigma_min, sigma_max),
         total_counts_range=total_counts_range,
-        counts_per_pixel_range=None,
-        blur_sigma_range=(0.15, 0.85),
-        edge_padding=0,
-        normalize_input=True,
-        clamp_target=True,
+        quiet_background=quiet_background,
     )
     return render_atom_image(
         coordinates_yx,
@@ -625,33 +672,66 @@ def _make_ws2_edge_record(
         sigmas=sigmas,
         target_coordinates=coordinates_yx,
         metadata={
-            'image_type': 'ws2_monolayer_edge',
+            'image_type': f'{structure_name}_monolayer_edge',
             'visible_atom_count': int(len(coordinates_yx)),
-            'w_columns': int(np.sum(numbers >= 74)),
-            's_columns': int(np.sum(numbers < 74)),
-            'pixel_size_angstrom': float(ws2_pixel_size_angstrom),
+            'heavy_columns': int(np.sum(numbers >= heavy_atomic_number)),
+            's_columns': int(np.sum(numbers < heavy_atomic_number)),
+            'pixel_size_angstrom': float(tmd_pixel_size_angstrom),
         },
     )
+
+
+def _make_ws2_edge_record(
+    shape: tuple[int, int],
+    seed: int,
+    sigma_range: tuple[float, float],
+    total_counts_range: tuple[float, float] = (35.0, 250.0),
+    quiet_background: bool = False,
+) -> dict[str, Any]:
+    return _make_tmd_edge_record(shape, seed, sigma_range, total_counts_range=total_counts_range, structure_name='ws2', quiet_background=quiet_background)
+
+
+def _make_mos2_edge_record(
+    shape: tuple[int, int],
+    seed: int,
+    sigma_range: tuple[float, float],
+    total_counts_range: tuple[float, float] = (35.0, 250.0),
+    quiet_background: bool = False,
+) -> dict[str, Any]:
+    return _make_tmd_edge_record(shape, seed, sigma_range, total_counts_range=total_counts_range, structure_name='mos2', quiet_background=quiet_background)
 
 
 def _edge_figure_render_config(
     shape: tuple[int, int],
     sigma_range: tuple[float, float],
     total_counts_range: tuple[float, float] = (35.0, 250.0),
+    quiet_background: bool = False,
 ) -> ImageFormationConfig:
     sigma_min, sigma_max = float(sigma_range[0]), float(sigma_range[1])
+    if quiet_background:
+        background_range = (0.018, 0.090)
+        gradient_range = (-0.035, 0.035)
+        inhomogeneous_background_range = (0.025, 0.075)
+        low_frequency_noise_range = (0.018, 0.075)
+        read_noise_std_range = (0.018, 0.060)
+    else:
+        background_range = (0.04, 0.32)
+        gradient_range = (-0.08, 0.08)
+        inhomogeneous_background_range = (0.07, 0.18)
+        low_frequency_noise_range = (0.05, 0.20)
+        read_noise_std_range = (0.08, 0.22)
     return ImageFormationConfig(
         image_shape=shape,
         sigma_range=(sigma_min, sigma_max),
         intensity_range=(0.2, 1.0),
         target_sigma=2.0,
-        background_range=(0.04, 0.32),
-        gradient_range=(-0.08, 0.08),
-        inhomogeneous_background_range=(0.07, 0.18),
+        background_range=background_range,
+        gradient_range=gradient_range,
+        inhomogeneous_background_range=inhomogeneous_background_range,
         inhomogeneous_background_sigma_fraction_range=(0.16, 0.42),
-        low_frequency_noise_range=(0.05, 0.20),
+        low_frequency_noise_range=low_frequency_noise_range,
         low_frequency_sigma_fraction_range=(0.05, 0.14),
-        read_noise_std_range=(0.08, 0.22),
+        read_noise_std_range=read_noise_std_range,
         total_counts_range=total_counts_range,
         counts_per_pixel_range=None,
         blur_sigma_range=(0.15, 0.85),
@@ -681,6 +761,7 @@ def _make_sto_edge_record(
     seed: int,
     sigma_range: tuple[float, float],
     total_counts_range: tuple[float, float] = (35.0, 250.0),
+    quiet_background: bool = False,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     unit = build_ase_structure_unit_cell('sto')
@@ -723,7 +804,7 @@ def _make_sto_edge_record(
 
     return render_atom_image(
         coordinates_yx,
-        _edge_figure_render_config(shape, sigma_range, total_counts_range=total_counts_range),
+        _edge_figure_render_config(shape, sigma_range, total_counts_range=total_counts_range, quiet_background=quiet_background),
         rng,
         intensities=_normalized_species_intensities(numbers),
         sigmas=_sigmas_from_species(numbers, sigma_range),
@@ -741,6 +822,7 @@ def _make_graphene_rattled_edge_record(
     seed: int,
     sigma_range: tuple[float, float],
     total_counts_range: tuple[float, float] = (35.0, 250.0),
+    quiet_background: bool = False,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     nearest_neighbor_px = 15.0
@@ -792,7 +874,7 @@ def _make_graphene_rattled_edge_record(
     sigmas = rng.uniform(sigma_min, sigma_max, size=len(coordinates_yx)).astype(np.float32)
     return render_atom_image(
         coordinates_yx,
-        _edge_figure_render_config(shape, sigma_range, total_counts_range=total_counts_range),
+        _edge_figure_render_config(shape, sigma_range, total_counts_range=total_counts_range, quiet_background=quiet_background),
         rng,
         intensities=np.full((len(coordinates_yx),), 0.78, dtype=np.float32),
         sigmas=sigmas,
@@ -874,6 +956,7 @@ def _plot_localization_scatter_for_figure(
     shape: tuple[int, int],
     title: str,
     show_legend: bool = False,
+    marker_color: str = '#2e7d32',
 ) -> None:
     ax.set_facecolor('#fbfbf7')
     true_positive = np.asarray(classes['true_positives'], dtype=np.float32)
@@ -881,7 +964,7 @@ def _plot_localization_scatter_for_figure(
     false_negative = np.asarray(classes['false_negatives'], dtype=np.float32)
 
     if len(true_positive):
-        ax.scatter(true_positive[:, 1], true_positive[:, 0], s=13, c='#2e7d32', marker='o', linewidths=0, alpha=0.86, label='TP')
+        ax.scatter(true_positive[:, 1], true_positive[:, 0], s=13, c=marker_color, marker='o', linewidths=0, alpha=0.86, label='TP')
     if len(false_positive):
         ax.scatter(false_positive[:, 1], false_positive[:, 0], s=22, c='#c62828', marker='x', linewidths=0.9, alpha=0.9, label='FP')
     if len(false_negative):
@@ -894,11 +977,20 @@ def _plot_localization_scatter_for_figure(
     ax.set_yticks([])
     if show_legend:
         handles = [
-            Line2D([0], [0], marker='o', color='none', markerfacecolor='#2e7d32', markeredgecolor='#2e7d32', markersize=5, label='TP'),
-            Line2D([0], [0], marker='x', color='#c62828', markersize=6, linestyle='None', label='FP'),
-            Line2D([0], [0], marker='o', color='#6a1b9a', markerfacecolor='none', markersize=6, linestyle='None', label='FN'),
+            Line2D([0], [0], marker='o', color='none', markerfacecolor=marker_color, markeredgecolor=marker_color, markersize=5, label=f"TP: {int(classes['tp'])}"),
+            Line2D([0], [0], marker='x', color='#c62828', markersize=6, linestyle='None', label=f"FP: {int(classes['fp'])}"),
+            Line2D([0], [0], marker='o', color='#6a1b9a', markerfacecolor='none', markersize=6, linestyle='None', label=f"FN: {int(classes['fn'])}"),
         ]
-        ax.legend(handles=handles, loc='upper right', fontsize=AXIS_TICK_SIZE, frameon=True)
+        ax.legend(handles=handles, loc='upper right', fontsize=9, frameon=True, handlelength=0.9, borderpad=0.25, labelspacing=0.25)
+
+
+def _plot_ground_truth_for_figure(
+    ax: plt.Axes,
+    target: np.ndarray,
+) -> None:
+    ax.imshow(np.asarray(target, dtype=np.float32), cmap='magma', vmin=0.0, vmax=max(float(np.max(target)), 1e-6))
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 def make_figure_4(args: argparse.Namespace) -> Path:
@@ -1063,21 +1155,22 @@ def make_figure_5(args: argparse.Namespace) -> Path:
         spec.key: _load_blobnet_model(spec.checkpoint, device, args.num_filters, args.dropout)
         for spec in models
     }
-    figure5_counts = (12.0, 90.0)
+    figure5_counts = (16.0, 16.0)
     cases = [
-        ('ws2_edge', _make_ws2_edge_record(shape, args.seed, sigma_range, total_counts_range=figure5_counts)),
-        ('srtio3_edge', _make_sto_edge_record(shape, args.seed + 101, sigma_range, total_counts_range=figure5_counts)),
-        ('graphene_rattled_edge', _make_graphene_rattled_edge_record(shape, args.seed + 202, sigma_range, total_counts_range=figure5_counts)),
+        ('mos2_edge', _make_mos2_edge_record(shape, args.seed, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
+        ('srtio3_edge', _make_sto_edge_record(shape, args.seed + 101, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
+        ('graphene_rattled_edge', _make_graphene_rattled_edge_record(shape, args.seed + 202, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
     ]
 
-    fig = plt.figure(figsize=(16.0, 11.4), constrained_layout=True)
-    grid = fig.add_gridspec(len(cases), 4, width_ratios=[1.05, 1.0, 1.0, 1.0], wspace=0.05, hspace=0.05)
+    fig = plt.figure(figsize=(20.0, 11.4), constrained_layout=True)
+    grid = fig.add_gridspec(len(cases), 5, width_ratios=[1.05, 1.0, 1.0, 1.0, 1.0], wspace=0.05, hspace=0.05)
     summary: dict[str, Any] = {
         'output_path': str(output_dir / 'figure5_edge_lattice_model_diagnostics.png'),
         'seed': int(args.seed),
         'shape': [int(args.height), int(args.width)],
         'feature_sigma_range_px': [float(args.feature_sigma_min), float(args.feature_sigma_max)],
         'poisson_total_counts_range': [float(figure5_counts[0]), float(figure5_counts[1])],
+        'background_profile': 'medium_background_poisson_count_16',
         'localization_settings': {
             'threshold_rel': float(args.localization_threshold_rel),
             'match_distance_px': float(args.localization_match_distance),
@@ -1090,20 +1183,35 @@ def make_figure_5(args: argparse.Namespace) -> Path:
 
     for row, (case_key, record) in enumerate(cases):
         image = np.asarray(record['image'], dtype=np.float32)
+        target = np.asarray(record['target'], dtype=np.float32)
         coordinates = np.asarray(record['coordinates'], dtype=np.float32)
         ax_image = fig.add_subplot(grid[row, 0])
         _plot_clean_image(ax_image, image, '')
+
+        ax_ground_truth = fig.add_subplot(grid[row, 1])
+        _plot_ground_truth_for_figure(ax_ground_truth, target)
 
         case_predictions = {
             spec.key: _predict_array(loaded_models[spec.key], image, device)
             for spec in models
         }
-        case_threshold_rel = 0.65 if case_key == 'graphene_rattled_edge' else float(args.localization_threshold_rel)
+        case_thresholds = {
+            spec.key: 0.50
+            for spec in models
+        }
+        if case_key == 'mos2_edge':
+            case_thresholds['hexagonal'] = 0.30
+            case_thresholds['random'] = 0.24
+        elif case_key == 'srtio3_edge':
+            case_thresholds['random'] = 0.42
+        elif case_key == 'graphene_rattled_edge':
+            case_thresholds['hexagonal'] = 0.95
+            case_thresholds['random'] = 0.62
         case_localization = {
             spec.key: _localization_classes_for_figure(
                 case_predictions[spec.key],
                 coordinates,
-                threshold_rel=case_threshold_rel,
+                threshold_rel=case_thresholds[spec.key],
                 min_distance=args.peak_min_distance,
                 peak_window_size=args.peak_window_size,
                 match_distance=args.localization_match_distance,
@@ -1111,14 +1219,15 @@ def make_figure_5(args: argparse.Namespace) -> Path:
             for spec in models
         }
 
-        for column, spec in enumerate(models, start=1):
+        for column, spec in enumerate(models, start=2):
             scatter_ax = fig.add_subplot(grid[row, column])
             _plot_localization_scatter_for_figure(
                 scatter_ax,
                 case_localization[spec.key],
                 shape,
                 spec.label,
-                show_legend=(row == 0 and column == 1),
+                show_legend=True,
+                marker_color=MODEL_COLORS.get(spec.key, '#2e7d32'),
             )
 
         summary['cases'][case_key] = {
@@ -1126,7 +1235,10 @@ def make_figure_5(args: argparse.Namespace) -> Path:
             'visible_atom_count': int(record.get('visible_atom_count', len(coordinates))),
             'pixel_size_angstrom': float(record.get('pixel_size_angstrom', 0.0)),
             'nearest_neighbor_spacing_px': _nearest_spacing_summary(coordinates),
-            'localization_threshold_rel': float(case_threshold_rel),
+            'localization_threshold_rel': {
+                key: float(value)
+                for key, value in case_thresholds.items()
+            },
             'localization_metrics': {
                 key: _localization_metric_summary(value)
                 for key, value in case_localization.items()
@@ -1155,7 +1267,7 @@ def _spacing_variation_image(atom_sigma: float = 2.7) -> np.ndarray:
     shape = (360, 360)
     positions = []
     numbers = []
-    for y, spacing in zip(np.linspace(32, 328, 8), [7.5, 10.5, 14.5, 20.5, 30.0, 45.0, 68.0, 104.0]):
+    for y, spacing in zip(np.linspace(32, 328, 8), [10.0, 10.5, 14.5, 20.5, 30.0, 45.0, 68.0, 104.0]):
         atom_count = max(3, int(round((shape[1] - 56) / spacing)) + 1)
         xs = np.linspace(28, shape[1] - 28, atom_count, dtype=np.float32)
         for x in xs:
@@ -1336,7 +1448,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
     spacing_prediction = _predict_array(model, spacing_image, device)
     size_prediction = _predict_array(model, size_image, device)
 
-    fig = plt.figure(figsize=(17.5, 7.4), constrained_layout=True)
+    fig = plt.figure(figsize=(14.0, 7.4), constrained_layout=True)
     grid = fig.add_gridspec(2, 4, width_ratios=[1.0, 1.0, 0.04, 2.55], height_ratios=[1, 1], wspace=0.08, hspace=0.08)
 
     ax_spacing = fig.add_subplot(grid[0, 0])
@@ -1431,6 +1543,9 @@ def build_parser() -> argparse.ArgumentParser:
     figure2.add_argument('--batch-size', type=int, default=4)
     figure2.add_argument('--dog-small', type=float, default=1.0)
     figure2.add_argument('--dog-large', type=float, default=20.0)
+    figure2.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
+    figure2.add_argument('--feature-match-sigma-px', type=float, default=2.9)
+    figure2.add_argument('--experimental-crop-size', type=int, default=512)
     figure2.set_defaults(func=make_figure_2)
 
     figure3 = subparsers.add_parser('figure3', help='Scale and spacing robustness figure.')
@@ -1497,6 +1612,9 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument('--tile-overlap', type=int, default=64)
     all_parser.add_argument('--dog-small', type=float, default=1.0)
     all_parser.add_argument('--dog-large', type=float, default=20.0)
+    all_parser.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
+    all_parser.add_argument('--feature-match-sigma-px', type=float, default=2.9)
+    all_parser.add_argument('--experimental-crop-size', type=int, default=512)
     _add_edge_localization_arguments(all_parser)
     all_parser.set_defaults(func=None)
     return parser
