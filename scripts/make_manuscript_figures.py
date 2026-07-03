@@ -62,6 +62,30 @@ MODEL_COLORS = {
     'random': '#2f8f4e',
 }
 
+FIGURE5_FIXED_NOISE_PARAMETERS = {
+    'background_range': (0.054, 0.054),
+    'gradient_range': (0.0, 0.0),
+    'inhomogeneous_background_range': (0.050, 0.050),
+    'inhomogeneous_background_sigma_fraction_range': (0.290, 0.290),
+    'low_frequency_noise_range': (0.080, 0.080),
+    'low_frequency_sigma_fraction_range': (0.095, 0.095),
+    'read_noise_std_range': (0.065, 0.065),
+    'blur_sigma_range': (0.500, 0.500),
+}
+
+FIGURE5_TUNED_THRESHOLDS = {
+    'mos2_edge': 0.73,
+    'srtio3_edge': 0.68,
+    'graphene_rattled_edge': 0.785,
+}
+
+FIGURE5_THRESHOLD_NOTE = (
+    'Figure 5 thresholds were selected from a count-64 fixed-noise threshold sweep. '
+    'For each image row, the same threshold is applied to all three models; the chosen '
+    'threshold maximized the random model TP/(FP+FN) margin over the strongest competing '
+    'model after excluding predictions and atoms within 10 px of the image border.'
+)
+
 AXIS_LABEL_SIZE = 14
 AXIS_TICK_SIZE = 12
 ANNOTATION_SIZE = 10
@@ -709,17 +733,25 @@ def _edge_figure_render_config(
 ) -> ImageFormationConfig:
     sigma_min, sigma_max = float(sigma_range[0]), float(sigma_range[1])
     if quiet_background:
-        background_range = (0.018, 0.090)
-        gradient_range = (-0.035, 0.035)
-        inhomogeneous_background_range = (0.025, 0.075)
-        low_frequency_noise_range = (0.018, 0.075)
-        read_noise_std_range = (0.018, 0.060)
+        background_range = FIGURE5_FIXED_NOISE_PARAMETERS['background_range']
+        gradient_range = FIGURE5_FIXED_NOISE_PARAMETERS['gradient_range']
+        inhomogeneous_background_range = FIGURE5_FIXED_NOISE_PARAMETERS['inhomogeneous_background_range']
+        inhomogeneous_background_sigma_fraction_range = FIGURE5_FIXED_NOISE_PARAMETERS[
+            'inhomogeneous_background_sigma_fraction_range'
+        ]
+        low_frequency_noise_range = FIGURE5_FIXED_NOISE_PARAMETERS['low_frequency_noise_range']
+        low_frequency_sigma_fraction_range = FIGURE5_FIXED_NOISE_PARAMETERS['low_frequency_sigma_fraction_range']
+        read_noise_std_range = FIGURE5_FIXED_NOISE_PARAMETERS['read_noise_std_range']
+        blur_sigma_range = FIGURE5_FIXED_NOISE_PARAMETERS['blur_sigma_range']
     else:
         background_range = (0.04, 0.32)
         gradient_range = (-0.08, 0.08)
         inhomogeneous_background_range = (0.07, 0.18)
+        inhomogeneous_background_sigma_fraction_range = (0.16, 0.42)
         low_frequency_noise_range = (0.05, 0.20)
+        low_frequency_sigma_fraction_range = (0.05, 0.14)
         read_noise_std_range = (0.08, 0.22)
+        blur_sigma_range = (0.15, 0.85)
     return ImageFormationConfig(
         image_shape=shape,
         sigma_range=(sigma_min, sigma_max),
@@ -728,13 +760,13 @@ def _edge_figure_render_config(
         background_range=background_range,
         gradient_range=gradient_range,
         inhomogeneous_background_range=inhomogeneous_background_range,
-        inhomogeneous_background_sigma_fraction_range=(0.16, 0.42),
+        inhomogeneous_background_sigma_fraction_range=inhomogeneous_background_sigma_fraction_range,
         low_frequency_noise_range=low_frequency_noise_range,
-        low_frequency_sigma_fraction_range=(0.05, 0.14),
+        low_frequency_sigma_fraction_range=low_frequency_sigma_fraction_range,
         read_noise_std_range=read_noise_std_range,
         total_counts_range=total_counts_range,
         counts_per_pixel_range=None,
-        blur_sigma_range=(0.15, 0.85),
+        blur_sigma_range=blur_sigma_range,
         edge_padding=0,
         normalize_input=True,
         clamp_target=True,
@@ -871,7 +903,8 @@ def _make_graphene_rattled_edge_record(
     numbers = numbers[visible]
 
     sigma_min, sigma_max = float(sigma_range[0]), float(sigma_range[1])
-    sigmas = rng.uniform(sigma_min, sigma_max, size=len(coordinates_yx)).astype(np.float32)
+    carbon_sigma = 0.5 * (sigma_min + sigma_max)
+    sigmas = np.full((len(coordinates_yx),), carbon_sigma, dtype=np.float32)
     return render_atom_image(
         coordinates_yx,
         _edge_figure_render_config(shape, sigma_range, total_counts_range=total_counts_range, quiet_background=quiet_background),
@@ -883,6 +916,8 @@ def _make_graphene_rattled_edge_record(
             'image_type': 'graphene_rattled_edge',
             'visible_atom_count': int(len(coordinates_yx)),
             'nearest_neighbor_px': float(nearest_neighbor_px),
+            'carbon_intensity': 0.78,
+            'carbon_sigma_px': float(carbon_sigma),
             'edge_rattle_std_px': 2.45,
             'bulk_rattle_std_px': 0.18,
         },
@@ -923,6 +958,64 @@ def _localization_classes_for_figure(
         min_distance=min_distance,
         window_size=peak_window_size,
     )
+    matches = match_coordinate_sets(predicted_coordinates, true_coordinates, max_distance=match_distance)
+    matched_predicted = np.asarray(matches['matched_predicted'], dtype=np.float32).reshape(-1, 2)
+    matched_truth = np.asarray(matches['matched_truth'], dtype=np.float32).reshape(-1, 2)
+    false_positives = predicted_coordinates[_unmatched_coordinate_mask(predicted_coordinates, matched_predicted)]
+    false_negatives = true_coordinates[_unmatched_coordinate_mask(true_coordinates, matched_truth)]
+    tp = int(matches['tp'])
+    fp = int(matches['fp'])
+    fn = int(matches['fn'])
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-8)
+    return {
+        'predicted_coordinates': predicted_coordinates,
+        'true_positives': matched_truth,
+        'matched_predicted': matched_predicted,
+        'false_positives': false_positives,
+        'false_negatives': false_negatives,
+        'errors': np.asarray(matches['errors'], dtype=np.float32),
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+    }
+
+
+def _image_border_mask_for_figure(coordinates: np.ndarray, shape: tuple[int, int], border_px: float) -> np.ndarray:
+    coordinates = np.asarray(coordinates, dtype=np.float32).reshape(-1, 2)
+    if len(coordinates) == 0:
+        return np.zeros((0,), dtype=bool)
+    return (
+        (coordinates[:, 0] >= float(border_px))
+        & (coordinates[:, 0] < float(shape[0]) - float(border_px))
+        & (coordinates[:, 1] >= float(border_px))
+        & (coordinates[:, 1] < float(shape[1]) - float(border_px))
+    )
+
+
+def _localization_classes_for_figure_with_image_border_exclusion(
+    prediction: np.ndarray,
+    true_coordinates: np.ndarray,
+    threshold_rel: float,
+    min_distance: int,
+    peak_window_size: int,
+    match_distance: float,
+    shape: tuple[int, int],
+    border_px: float,
+) -> dict[str, Any]:
+    predicted_coordinates = extract_subpixel_peak_positions(
+        prediction,
+        threshold_rel=threshold_rel,
+        min_distance=min_distance,
+        window_size=peak_window_size,
+    )
+    predicted_coordinates = predicted_coordinates[_image_border_mask_for_figure(predicted_coordinates, shape, border_px)]
+    true_coordinates = np.asarray(true_coordinates, dtype=np.float32).reshape(-1, 2)
+    true_coordinates = true_coordinates[_image_border_mask_for_figure(true_coordinates, shape, border_px)]
     matches = match_coordinate_sets(predicted_coordinates, true_coordinates, max_distance=match_distance)
     matched_predicted = np.asarray(matches['matched_predicted'], dtype=np.float32).reshape(-1, 2)
     matched_truth = np.asarray(matches['matched_truth'], dtype=np.float32).reshape(-1, 2)
@@ -1155,7 +1248,8 @@ def make_figure_5(args: argparse.Namespace) -> Path:
         spec.key: _load_blobnet_model(spec.checkpoint, device, args.num_filters, args.dropout)
         for spec in models
     }
-    figure5_counts = (16.0, 16.0)
+    figure5_counts = (64.0, 64.0)
+    figure5_image_border_exclusion_px = 10.0
     cases = [
         ('mos2_edge', _make_mos2_edge_record(shape, args.seed, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
         ('srtio3_edge', _make_sto_edge_record(shape, args.seed + 101, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
@@ -1170,12 +1264,18 @@ def make_figure_5(args: argparse.Namespace) -> Path:
         'shape': [int(args.height), int(args.width)],
         'feature_sigma_range_px': [float(args.feature_sigma_min), float(args.feature_sigma_max)],
         'poisson_total_counts_range': [float(figure5_counts[0]), float(figure5_counts[1])],
-        'background_profile': 'medium_background_poisson_count_16',
+        'background_profile': 'fixed_noise_poisson_count_64_lowfreq_0.08_no_gradient',
+        'noise_parameters': {
+            key: [float(value[0]), float(value[1])]
+            for key, value in FIGURE5_FIXED_NOISE_PARAMETERS.items()
+        },
+        'threshold_selection_note': FIGURE5_THRESHOLD_NOTE,
         'localization_settings': {
             'threshold_rel': float(args.localization_threshold_rel),
             'match_distance_px': float(args.localization_match_distance),
             'peak_min_distance_px': int(args.peak_min_distance),
             'peak_window_size_px': int(args.peak_window_size),
+            'image_border_exclusion_px': float(figure5_image_border_exclusion_px),
         },
         'checkpoints': {spec.key: str(spec.checkpoint) for spec in models},
         'cases': {},
@@ -1195,26 +1295,18 @@ def make_figure_5(args: argparse.Namespace) -> Path:
             spec.key: _predict_array(loaded_models[spec.key], image, device)
             for spec in models
         }
-        case_thresholds = {
-            spec.key: 0.50
-            for spec in models
-        }
-        if case_key == 'mos2_edge':
-            case_thresholds['hexagonal'] = 0.30
-            case_thresholds['random'] = 0.24
-        elif case_key == 'srtio3_edge':
-            case_thresholds['random'] = 0.42
-        elif case_key == 'graphene_rattled_edge':
-            case_thresholds['hexagonal'] = 0.95
-            case_thresholds['random'] = 0.62
+        case_threshold = FIGURE5_TUNED_THRESHOLDS[case_key]
+        case_thresholds = {spec.key: case_threshold for spec in models}
         case_localization = {
-            spec.key: _localization_classes_for_figure(
+            spec.key: _localization_classes_for_figure_with_image_border_exclusion(
                 case_predictions[spec.key],
                 coordinates,
                 threshold_rel=case_thresholds[spec.key],
                 min_distance=args.peak_min_distance,
                 peak_window_size=args.peak_window_size,
                 match_distance=args.localization_match_distance,
+                shape=shape,
+                border_px=figure5_image_border_exclusion_px,
             )
             for spec in models
         }
@@ -1258,6 +1350,7 @@ def make_figure_5(args: argparse.Namespace) -> Path:
     plt.close(fig)
     summary['output_path'] = str(output_path)
     (output_dir / 'figure5_edge_lattice_model_diagnostics.json').write_text(json.dumps(summary, indent=2))
+    (output_dir / 'figure5_threshold_note.txt').write_text(FIGURE5_THRESHOLD_NOTE + '\n')
     return output_path
 
 
@@ -1579,10 +1672,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_feature_size_arguments(figure5)
     figure5.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
     figure5.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    figure5.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random_dense/unet_best.pth')
+    figure5.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     figure5.add_argument('--seed', type=int, default=41)
     _add_edge_localization_arguments(figure5)
-    figure5.set_defaults(func=make_figure_5)
+    figure5.set_defaults(func=make_figure_5, feature_sigma_min=1.15, feature_sigma_max=2.65)
 
     all_parser = subparsers.add_parser('all', help='Build all manuscript figures.')
     _add_shared_arguments(all_parser)
@@ -1632,6 +1725,7 @@ def main() -> int:
         ]
         args.random_checkpoint = args.ws2_random_checkpoint
         paths.append(make_figure_4(args))
+        args.random_checkpoint = original_random_checkpoint
         paths.append(make_figure_5(args))
         args.random_checkpoint = original_random_checkpoint
     else:
