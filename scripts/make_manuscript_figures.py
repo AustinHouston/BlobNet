@@ -13,7 +13,7 @@ import h5py
 import numpy as np
 import torch
 import yaml
-from scipy.ndimage import gaussian_filter, zoom
+from scipy.ndimage import gaussian_filter, gaussian_laplace, zoom
 from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader
 
@@ -562,6 +562,222 @@ def make_figure_2(args: argparse.Namespace) -> Path:
         for (label, image, transform), output in zip(images, outputs)
     ]
     (output_dir / 'figure2_experimental_haadf_outputs.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def _experimental_figure_files(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    return [
+        ('WS2 grain boundary', args.data_dir / 'WS2.emd'),
+        ('Quasicrystal', args.data_dir / 'QuasiCrystal.emd'),
+        ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
+        ('Twins overview', args.data_dir / 'TwinsOverview.emd'),
+    ]
+
+
+def _poisson_noisy_image(image: np.ndarray, total_counts: float, rng: np.random.Generator) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    scaled = np.clip(image, 0.0, None)
+    scaled = scaled / max(float(scaled.max()), 1e-8)
+    counts = rng.poisson(scaled * float(total_counts)).astype(np.float32)
+    noisy = counts / max(float(total_counts), 1e-8)
+    return _normalize_image(noisy, low=0.0, high=99.8)
+
+
+def _log_blob_positions(
+    image: np.ndarray,
+    sigma_px: float,
+    threshold_rel: float,
+    min_distance: int,
+    peak_window_size: int,
+    max_peaks: int | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    response = -gaussian_laplace(np.asarray(image, dtype=np.float32), sigma=float(sigma_px))
+    response = _normalize_image(np.clip(response, 0.0, None), low=1.0, high=99.8)
+    coordinates = extract_subpixel_peak_positions(
+        response,
+        threshold_rel=threshold_rel,
+        min_distance=min_distance,
+        window_size=peak_window_size,
+        max_peaks=max_peaks,
+    )
+    return coordinates, response
+
+
+def _prediction_positions(
+    prediction: np.ndarray,
+    threshold_rel: float,
+    min_distance: int,
+    peak_window_size: int,
+    max_peaks: int | None,
+) -> np.ndarray:
+    return extract_subpixel_peak_positions(
+        prediction,
+        threshold_rel=threshold_rel,
+        min_distance=min_distance,
+        window_size=peak_window_size,
+        max_peaks=max_peaks,
+    )
+
+
+def _plot_experimental_localization_overlay(
+    ax: plt.Axes,
+    image: np.ndarray,
+    blobnet_coordinates: np.ndarray,
+    log_coordinates: np.ndarray,
+    title: str,
+    show_legend: bool = False,
+) -> None:
+    ax.imshow(image, cmap='gray', vmin=0.0, vmax=1.0)
+    blobnet_coordinates = np.asarray(blobnet_coordinates, dtype=np.float32).reshape(-1, 2)
+    log_coordinates = np.asarray(log_coordinates, dtype=np.float32).reshape(-1, 2)
+    if len(log_coordinates):
+        ax.scatter(
+            log_coordinates[:, 1],
+            log_coordinates[:, 0],
+            s=26,
+            facecolors='none',
+            edgecolors='#f28e2b',
+            marker='o',
+            linewidths=0.85,
+            alpha=0.82,
+            label='LoG',
+        )
+    if len(blobnet_coordinates):
+        ax.scatter(
+            blobnet_coordinates[:, 1],
+            blobnet_coordinates[:, 0],
+            s=10,
+            c='#3fb950',
+            marker='.',
+            linewidths=0,
+            alpha=0.9,
+            label='BlobNet',
+        )
+    ax.set_title(title, fontsize=AXIS_LABEL_SIZE)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if show_legend:
+        handles = [
+            Line2D([0], [0], marker='.', color='#3fb950', markersize=8, linestyle='None', label='BlobNet'),
+            Line2D([0], [0], marker='o', color='#f28e2b', markerfacecolor='none', markersize=6, linestyle='None', label='LoG'),
+        ]
+        ax.legend(handles=handles, loc='upper right', fontsize=9, frameon=True, borderpad=0.25, labelspacing=0.25)
+
+
+def make_figure_2_localizations(args: argparse.Namespace) -> Path:
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
+    measurements = _read_experimental_feature_measurements(args.experimental_measurements)
+    rng = np.random.default_rng(args.seed)
+
+    panels: list[dict[str, Any]] = []
+    for label, path in _experimental_figure_files(args):
+        image = _load_experimental_image(path)
+        model_input, transform = _make_feature_matched_experimental_view(
+            image,
+            measurements[path.stem],
+            dog_small=args.dog_small,
+            dog_large=args.dog_large,
+            target_sigma_px=args.feature_match_sigma_px,
+            crop_size=args.experimental_crop_size,
+        )
+        variants = [
+            ('clean', model_input, None),
+            (f'poisson_{int(args.poisson_counts)}', _poisson_noisy_image(model_input, args.poisson_counts, rng), args.poisson_counts),
+            (
+                f'poisson_{int(args.heavy_poisson_counts)}',
+                _poisson_noisy_image(model_input, args.heavy_poisson_counts, rng),
+                args.heavy_poisson_counts,
+            ),
+        ]
+        predictions: dict[str, np.ndarray] = {}
+        blobnet_coordinates: dict[str, np.ndarray] = {}
+        log_coordinates: dict[str, np.ndarray] = {}
+        for key, variant_image, _counts in variants:
+            prediction = _predict_tiled(model, variant_image, device, args.tile_size, args.tile_overlap, args.batch_size)
+            predictions[key] = prediction
+            blobnet_coordinates[key] = _prediction_positions(
+                prediction,
+                threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance,
+                peak_window_size=args.peak_window_size,
+                max_peaks=args.max_peaks,
+            )
+            log_coordinates[key], _response = _log_blob_positions(
+                variant_image,
+                sigma_px=args.log_sigma_px,
+                threshold_rel=args.log_threshold_rel,
+                min_distance=args.log_min_distance,
+                peak_window_size=args.peak_window_size,
+                max_peaks=args.max_peaks,
+            )
+
+        panels.append(
+            {
+                'label': label,
+                'path': str(path),
+                'input': model_input,
+                'transform': transform,
+                'variants': variants,
+                'predictions': predictions,
+                'blobnet_coordinates': blobnet_coordinates,
+                'log_coordinates': log_coordinates,
+            }
+        )
+
+    fig, axes = plt.subplots(4, len(panels), figsize=(16, 14.5), constrained_layout=True)
+    row_labels = [
+        'Figure 2 input',
+        'Clean localizations',
+        f'Poisson localizations ({args.poisson_counts:g} counts)',
+        f'Poisson localizations ({args.heavy_poisson_counts:g} counts)',
+    ]
+    variant_keys = ['clean', f'poisson_{int(args.poisson_counts)}', f'poisson_{int(args.heavy_poisson_counts)}']
+    for col, panel in enumerate(panels):
+        _plot_clean_image(axes[0, col], panel['input'], panel['label'], cmap='gray')
+        if col == 0:
+            axes[0, col].set_ylabel(row_labels[0], fontsize=AXIS_LABEL_SIZE)
+        for row, variant_key in enumerate(variant_keys, start=1):
+            variant_image = dict((key, image) for key, image, _counts in panel['variants'])[variant_key]
+            _plot_experimental_localization_overlay(
+                axes[row, col],
+                variant_image,
+                panel['blobnet_coordinates'][variant_key],
+                panel['log_coordinates'][variant_key],
+                '',
+                show_legend=(row == 1 and col == len(panels) - 1),
+            )
+            if col == 0:
+                axes[row, col].set_ylabel(row_labels[row], fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'figure2_experimental_localization_comparison.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = []
+    for panel in panels:
+        panel_summary = {
+            'label': panel['label'],
+            'path': panel['path'],
+            'shape_y': int(panel['input'].shape[0]),
+            'shape_x': int(panel['input'].shape[1]),
+            'display_processing': 'DoG background-subtracted, feature-sigma matched, center-cropped',
+            'target_sigma_px': float(args.feature_match_sigma_px),
+            **panel['transform'],
+            'variants': {},
+        }
+        for variant_key in variant_keys:
+            prediction = panel['predictions'][variant_key]
+            panel_summary['variants'][variant_key] = {
+                'blobnet_peaks': int(len(panel['blobnet_coordinates'][variant_key])),
+                'log_peaks': int(len(panel['log_coordinates'][variant_key])),
+                'prediction_mean': float(prediction.mean()),
+                'prediction_max': float(prediction.max()),
+            }
+        summary.append(panel_summary)
+    (output_dir / 'figure2_experimental_localization_comparison.json').write_text(json.dumps(summary, indent=2))
     return output_path
 
 
@@ -1640,6 +1856,34 @@ def build_parser() -> argparse.ArgumentParser:
     figure2.add_argument('--feature-match-sigma-px', type=float, default=2.9)
     figure2.add_argument('--experimental-crop-size', type=int, default=512)
     figure2.set_defaults(func=make_figure_2)
+
+    figure2_localizations = subparsers.add_parser(
+        'figure2-localizations',
+        help='Experimental HAADF localization comparison with BlobNet and LoG under Poisson noise.',
+    )
+    _add_shared_arguments(figure2_localizations)
+    _add_model_arguments(figure2_localizations)
+    figure2_localizations.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure2_localizations.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
+    figure2_localizations.add_argument('--tile-size', type=int, default=256)
+    figure2_localizations.add_argument('--tile-overlap', type=int, default=64)
+    figure2_localizations.add_argument('--batch-size', type=int, default=4)
+    figure2_localizations.add_argument('--dog-small', type=float, default=1.0)
+    figure2_localizations.add_argument('--dog-large', type=float, default=20.0)
+    figure2_localizations.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
+    figure2_localizations.add_argument('--feature-match-sigma-px', type=float, default=2.9)
+    figure2_localizations.add_argument('--experimental-crop-size', type=int, default=512)
+    figure2_localizations.add_argument('--seed', type=int, default=7)
+    figure2_localizations.add_argument('--poisson-counts', type=float, default=80.0)
+    figure2_localizations.add_argument('--heavy-poisson-counts', type=float, default=28.0)
+    figure2_localizations.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure2_localizations.add_argument('--peak-min-distance', type=int, default=3)
+    figure2_localizations.add_argument('--peak-window-size', type=int, default=5)
+    figure2_localizations.add_argument('--max-peaks', type=int)
+    figure2_localizations.add_argument('--log-sigma-px', type=float, default=2.9)
+    figure2_localizations.add_argument('--log-threshold-rel', type=float, default=0.35)
+    figure2_localizations.add_argument('--log-min-distance', type=int, default=5)
+    figure2_localizations.set_defaults(func=make_figure_2_localizations)
 
     figure3 = subparsers.add_parser('figure3', help='Scale and spacing robustness figure.')
     _add_shared_arguments(figure3)
