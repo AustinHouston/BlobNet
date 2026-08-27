@@ -655,14 +655,15 @@ def build_ase_structure_unit_cell(structure_name: str):
             cell=[(a, 0.0, 0.0), (0.5 * a, np.sqrt(3.0) * 0.5 * a, 0.0), (0.0, 0.0, 18.0)],
             pbc=(True, True, False),
         )
-    if structure_name in {"ws2", "ws2_mx2", "ws2-ase", "ws2_ase"}:
+    if structure_name in {"ws2", "ws2_mx2", "ws2-ase", "ws2_ase", "mos2", "mos2_mx2", "mos2-ase", "mos2_ase"}:
         try:
             from ase.build import mx2
         except ImportError as exc:
             raise ImportError(
-                "ASE's mx2 builder is required for the WS2 structure."
+                "ASE's mx2 builder is required for MX2 structures."
             ) from exc
-        atoms = mx2("WS2")
+        formula = "MoS2" if structure_name.startswith("mos2") else "WS2"
+        atoms = mx2(formula)
         atoms.cell[2, 2] = 20.0
         atoms.pbc = (True, True, False)
         return atoms
@@ -680,7 +681,7 @@ def build_ase_structure_unit_cell(structure_name: str):
             cell=[(a, 0.0, 0.0), (0.0, a, 0.0), (0.0, 0.0, a)],
             pbc=(True, True, True),
         )
-    raise ValueError("Unsupported ASE structure. Expected graphene, ws2, ws2_mx2, or sto.")
+    raise ValueError("Unsupported ASE structure. Expected graphene, ws2, mos2, ws2_mx2, mos2_mx2, or sto.")
 
 
 def _merge_projected_columns(

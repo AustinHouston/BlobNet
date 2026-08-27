@@ -55,7 +55,7 @@ parameters:
   # Additive Gaussian read-noise standard deviation after Poisson sampling.
   read_noise_std_range: [0.05, 0.2]
   # Total Poisson count scale per image; lower values produce stronger shot noise.
-  total_counts_range: [50.0, 25000.0]
+  total_counts_range: [1.0, 10.0]
   # Alternative to total_counts_range: counts per pixel. Must be null when total_counts_range is set.
   counts_per_pixel_range: null
   # Image blur sigma range in pixels applied before count sampling.
