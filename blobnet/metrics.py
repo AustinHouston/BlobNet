@@ -56,6 +56,9 @@ def extract_subpixel_peak_positions(
     candidates = candidates[order]
 
     refined_positions: List[np.ndarray] = []
+    # Avoid repeatedly stacking every previous coordinate for each candidate.
+    # The active slice is byte-for-byte equivalent to that stacked float32 array.
+    refined_buffer = np.empty((len(candidates), 2), dtype=np.float32)
     half_window = max(1, window_size // 2)
 
     for y, x in candidates:
@@ -63,7 +66,7 @@ def extract_subpixel_peak_positions(
             break
 
         if refined_positions:
-            distances = np.linalg.norm(np.stack(refined_positions) - np.array([y, x]), axis=1)
+            distances = np.linalg.norm(refined_buffer[:len(refined_positions)] - np.array([y, x]), axis=1)
             if np.any(distances < min_distance):
                 continue
 
@@ -78,6 +81,7 @@ def extract_subpixel_peak_positions(
 
         if weight_sum <= 0:
             refined_positions.append(np.array([y, x], dtype=np.float32))
+            refined_buffer[len(refined_positions) - 1] = refined_positions[-1]
             continue
 
         yy, xx = np.meshgrid(
@@ -88,6 +92,7 @@ def extract_subpixel_peak_positions(
         refined_y = float((yy * patch).sum() / weight_sum)
         refined_x = float((xx * patch).sum() / weight_sum)
         refined_positions.append(np.array([refined_y, refined_x], dtype=np.float32))
+        refined_buffer[len(refined_positions) - 1] = refined_positions[-1]
 
     if not refined_positions:
         return np.zeros((0, 2), dtype=np.float32)

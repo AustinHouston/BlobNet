@@ -51,18 +51,18 @@ The console script is declared in `pyproject.toml` and points to
 Useful subcommands:
 
 - `figure1`: synthetic training geometry/generalization figure.
-- `figure2`: experimental HAADF input/output figure.
-- `figure2-localizations`: experimental HAADF localization comparison with
+- `figure3`: experimental HAADF input/output figure.
+- `figure3-localizations`: experimental HAADF localization comparison with
   BlobNet and a LoG baseline under Poisson noise.
-- `figure3`: scale and spacing robustness figure.
-- `figure4`: simulated WS2 edge model comparison.
-- `figure5`: edge-structure TP/FP/FN diagnostics.
+- `figure4`: scale and spacing robustness figure.
+- `ws2-edge-comparison`: auxiliary simulated WS2 edge model comparison.
+- `figure2`: edge-structure TP/FP/FN diagnostics.
 - `all`: regenerate the standard manuscript figure set.
 
 Write new outputs to a fresh directory so older outputs are preserved:
 
 ```powershell
-uv run blobnet-manuscript-figures figure2 --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
+uv run blobnet-manuscript-figures figure3 --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
 ```
 
 ## Experimental Data Figures
@@ -97,23 +97,23 @@ and falls back to reading the largest 2D numeric dataset with `h5py`.
 
 ## Regenerating The Current Experimental Outputs
 
-Standard Figure 2:
+Standard Figure 3:
 
 ```powershell
-uv run blobnet-manuscript-figures figure2 --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
+uv run blobnet-manuscript-figures figure3 --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
 ```
 
 Experimental localization comparison:
 
 ```powershell
-uv run blobnet-manuscript-figures figure2-localizations --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
+uv run blobnet-manuscript-figures figure3-localizations --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
 ```
 
-The localization comparison uses the same Figure 2-style experimental inputs in
+The localization comparison uses the same Figure 3-style experimental inputs in
 the first row, then overlays BlobNet peaks and LoG blob detections on clean and
 Poisson-noised variants.
 
-Important options for `figure2-localizations`:
+Important options for `figure3-localizations`:
 
 - `--checkpoint`: BlobNet checkpoint. Default:
   `outputs/manuscript_models/random/unet_best.pth`.
@@ -133,7 +133,7 @@ Important options for `figure2-localizations`:
 Example with a barely visible high-noise final row:
 
 ```powershell
-uv run blobnet-manuscript-figures figure2-localizations --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS --heavy-poisson-counts 0.35
+uv run blobnet-manuscript-figures figure3-localizations --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS --heavy-poisson-counts 0.35
 ```
 
 Generated files include a PNG figure and a JSON summary with detection counts
@@ -152,7 +152,7 @@ Helpful existing functions:
 - `_predict_tiled`: tiled inference for larger images.
 - `_load_experimental_image`: reads and normalizes an experimental `.emd` image.
 - `_make_feature_matched_experimental_view`: DoG background subtraction,
-  feature-size matching, and center crop/pad used by Figure 2.
+  feature-size matching, and center crop/pad used by Figure 3.
 - `_plot_clean_image`: simple image panel plotting.
 - `extract_subpixel_peak_positions` from `blobnet.metrics`: local maximum peak
   extraction with subpixel refinement.
@@ -192,4 +192,3 @@ Then inspect the generated PNG visually. Check that:
 - Do not edit notebooks as the primary source of truth for figures.
 - Do not commit large generated outputs unless the user asks for them.
 - Do not revert unrelated local changes.
-

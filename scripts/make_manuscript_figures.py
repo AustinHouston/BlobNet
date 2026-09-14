@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +15,9 @@ import h5py
 import numpy as np
 import torch
 import yaml
+from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter, gaussian_laplace, zoom
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader
 
@@ -62,7 +66,7 @@ MODEL_COLORS = {
     'random': '#2f8f4e',
 }
 
-FIGURE5_FIXED_NOISE_PARAMETERS = {
+FIGURE2_FIXED_NOISE_PARAMETERS = {
     'background_range': (0.054, 0.054),
     'gradient_range': (0.0, 0.0),
     'inhomogeneous_background_range': (0.050, 0.050),
@@ -73,14 +77,14 @@ FIGURE5_FIXED_NOISE_PARAMETERS = {
     'blur_sigma_range': (0.500, 0.500),
 }
 
-FIGURE5_TUNED_THRESHOLDS = {
+FIGURE2_TUNED_THRESHOLDS = {
     'mos2_edge': 0.73,
     'srtio3_edge': 0.68,
     'graphene_rattled_edge': 0.785,
 }
 
-FIGURE5_THRESHOLD_NOTE = (
-    'Figure 5 thresholds were selected from a count-64 fixed-noise threshold sweep. '
+FIGURE2_THRESHOLD_NOTE = (
+    'Figure 2 thresholds were selected from a count-64 fixed-noise threshold sweep. '
     'For each image row, the same threshold is applied to all three models; the chosen '
     'threshold maximized the random model TP/(FP+FN) margin over the strongest competing '
     'model after excluding predictions and atoms within 10 px of the image border.'
@@ -228,12 +232,29 @@ def _find_haadf_with_pytemlib(path: Path) -> np.ndarray | None:
     except ImportError:
         return None
 
-    dataset = ft.open_file(str(path))
-    for key in dataset.keys():
-        candidate = dataset[key]
-        if getattr(candidate, 'title', '') == 'HAADF':
-            return np.asarray(candidate, dtype=np.float32)
-    return None
+    def select_haadf(dataset: Any) -> np.ndarray | None:
+        candidates = [
+            (str(getattr(candidate, 'title', '')), candidate)
+            for candidate in dataset.values()
+            if len(tuple(dimension for dimension in getattr(candidate, 'shape', ()) if dimension != 1)) == 2
+        ]
+        for preferred_title in ('HAADF', 'Ref HAADF'):
+            for title, candidate in candidates:
+                if title == preferred_title:
+                    return np.asarray(candidate, dtype=np.float32)
+        for title, candidate in candidates:
+            if 'HAADF' in title.upper():
+                return np.asarray(candidate, dtype=np.float32)
+        return None
+
+    try:
+        dataset = ft.open_file(str(path))
+    except OSError:
+        with tempfile.TemporaryDirectory(prefix='blobnet-emd-') as temp_dir:
+            copied_path = Path(temp_dir) / path.name
+            shutil.copyfile(path, copied_path)
+            return select_haadf(ft.open_file(str(copied_path)))
+    return select_haadf(dataset)
 
 
 def _find_haadf_with_h5py(path: Path) -> np.ndarray:
@@ -261,6 +282,96 @@ def _load_experimental_image(path: Path) -> np.ndarray:
     if image is None:
         image = _find_haadf_with_h5py(path)
     return _normalize_image(np.squeeze(image))
+
+
+def _decode_velox_json(dataset: h5py.Dataset, index: int = 0) -> dict[str, Any]:
+    raw = dataset[:, index] if dataset.ndim == 2 else dataset[index]
+    if isinstance(raw, bytes):
+        encoded = raw
+    elif isinstance(raw, str):
+        encoded = raw.encode('utf-8')
+    else:
+        encoded = np.asarray(raw, dtype=np.uint8).tobytes()
+    return json.loads(encoded.split(b'\x00', 1)[0].decode('utf-8'))
+
+
+def _load_velox_displayed_haadf(path: Path, crop_size: int) -> tuple[np.ndarray, float, dict[str, Any]]:
+    """Read the final displayed DCFI(HAADF), or HAADF fallback, from a Velox EMD."""
+    with h5py.File(path, 'r') as handle:
+        displays = handle.get('Presentation/Displays/ImageDisplay')
+        if displays is None:
+            raise ValueError(f'No Velox image displays found in {path}.')
+
+        candidates: list[tuple[int, str, int, str]] = []
+        for display_dataset in displays.values():
+            display = _decode_velox_json(display_dataset)
+            label = str(display.get('display', {}).get('label', ''))
+            data_path = str(display.get('dataPath', ''))
+            if not data_path or data_path.lstrip('/') not in handle:
+                continue
+            upper_label = label.upper()
+            if 'DCFI' in upper_label and 'HAADF' in upper_label:
+                priority = 0
+            elif 'HAADF' in upper_label:
+                priority = 1
+            else:
+                continue
+            candidates.append((priority, data_path, int(display.get('seriesIndex', 0)), label))
+
+        if not candidates:
+            raise ValueError(f'No displayed HAADF dataset found in {path}.')
+        _priority, data_path, series_index, display_label = min(candidates, key=lambda item: item[0])
+        group = handle[data_path.lstrip('/')]
+        data = group['Data']
+        if data.ndim == 3:
+            series_index = int(np.clip(series_index, 0, data.shape[2] - 1))
+            height, width = int(data.shape[0]), int(data.shape[1])
+            y0 = max((height - int(crop_size)) // 2, 0)
+            x0 = max((width - int(crop_size)) // 2, 0)
+            image = np.asarray(
+                data[y0 : min(y0 + crop_size, height), x0 : min(x0 + crop_size, width), series_index],
+                dtype=np.float32,
+            )
+        else:
+            full_image = np.asarray(data, dtype=np.float32).squeeze()
+            height, width = int(full_image.shape[0]), int(full_image.shape[1])
+            image = _center_crop_or_pad(full_image, int(crop_size))
+
+        metadata_index = min(series_index, group['Metadata'].shape[1] - 1)
+        metadata = _decode_velox_json(group['Metadata'], metadata_index)
+        binary_result = metadata['BinaryResult']
+        pixel_width_nm = float(binary_result['PixelSize']['width']) * 1e9
+        pixel_height_nm = float(binary_result['PixelSize']['height']) * 1e9
+        if not np.isclose(pixel_width_nm, pixel_height_nm):
+            raise ValueError(f'Non-square pixels in {path}: {pixel_width_nm} x {pixel_height_nm} nm.')
+
+    image = _center_crop_or_pad(_normalize_image(image), int(crop_size))
+    return image, float((pixel_width_nm + pixel_height_nm) / 2.0), {
+        'display_label': display_label,
+        'data_path': data_path,
+        'series_index': series_index,
+        'source_shape': [height, width],
+    }
+
+
+def _read_channel_pixel_size_nm(path: Path, channel: str = 'Channel_000') -> float:
+    import pyTEMlib.file_tools as ft
+
+    def read_pixel_size(dataset: Any) -> float:
+        binary_result = dataset[channel].original_metadata['BinaryResult']
+        width_nm = float(binary_result['PixelSize']['width']) * 1e9
+        height_nm = float(binary_result['PixelSize']['height']) * 1e9
+        if not np.isclose(width_nm, height_nm):
+            raise ValueError(f'Non-square pixels in {path}: {width_nm} x {height_nm} nm.')
+        return float((width_nm + height_nm) / 2.0)
+
+    try:
+        return read_pixel_size(ft.open_file(str(path)))
+    except OSError:
+        with tempfile.TemporaryDirectory(prefix='blobnet-emd-') as temp_dir:
+            copied_path = Path(temp_dir) / path.name
+            shutil.copyfile(path, copied_path)
+            return read_pixel_size(ft.open_file(str(copied_path)))
 
 
 def _center_crop_or_pad(image: np.ndarray, size: int) -> np.ndarray:
@@ -309,12 +420,77 @@ def _make_feature_matched_experimental_view(
     }
 
 
+def _make_fixed_fov_resolution_view(
+    image: np.ndarray,
+    dog_small: float,
+    dog_large: float,
+    display_size: int,
+    native_pixels: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    processed = gaussian_filter(image, dog_small) - gaussian_filter(image, dog_large)
+    processed = _normalize_image(processed)
+    display_view = _center_crop_or_pad(processed, int(display_size))
+    native_view = _normalize_image(
+        _interpolate_image(display_view, (int(native_pixels), int(native_pixels)))
+    )
+    return display_view, native_view, {
+        'display_processing': 'DoG background-subtracted, fixed center FOV, resolution-matched',
+        'display_pixels': int(display_size),
+        'native_inference_pixels': int(native_pixels),
+        'resolution_scale': float(native_pixels) / float(display_size),
+    }
+
+
+def _interpolate_image(image: np.ndarray, output_shape: tuple[int, int]) -> np.ndarray:
+    """Linearly resample an image to a requested pixel grid with SciPy."""
+    image = np.asarray(image, dtype=np.float32)
+    source_height, source_width = image.shape
+    output_height, output_width = (int(value) for value in output_shape)
+    if output_height <= 0 or output_width <= 0:
+        raise ValueError(f'Output shape must be positive, received {output_shape}.')
+
+    source_y = np.linspace(0.0, source_height - 1.0, output_height, dtype=np.float64)
+    source_x = np.linspace(0.0, source_width - 1.0, output_width, dtype=np.float64)
+    query_y, query_x = np.meshgrid(source_y, source_x, indexing='ij')
+    query_points = np.column_stack((query_y.ravel(), query_x.ravel()))
+    interpolator = RegularGridInterpolator(
+        (np.arange(source_height, dtype=np.float64), np.arange(source_width, dtype=np.float64)),
+        image,
+        method='linear',
+        bounds_error=True,
+    )
+    return interpolator(query_points).reshape(output_height, output_width).astype(np.float32)
+
+
 def _plot_clean_image(ax: plt.Axes, image: np.ndarray, title: str, cmap: str = 'gray') -> None:
     ax.imshow(image, cmap=cmap, vmin=0.0, vmax=1.0)
     if title:
         ax.set_title(title, fontsize=AXIS_LABEL_SIZE)
     ax.set_xticks([])
     ax.set_yticks([])
+
+
+def _add_physical_scale_bar(
+    ax: plt.Axes,
+    image_shape: tuple[int, int],
+    pixel_size_nm: float,
+    length_nm: float,
+    linewidth: float,
+) -> None:
+    """Add a lower-right scale bar whose displayed length follows the image metadata."""
+    height, width = image_shape
+    length_pixels = float(length_nm) / float(pixel_size_nm)
+    x_right = width * 0.94
+    x_left = x_right - length_pixels
+    y = height * 0.965
+    ax.plot(
+        [x_left, x_right],
+        [y, y],
+        color='white',
+        linewidth=linewidth,
+        solid_capstyle='butt',
+        zorder=10,
+    )
 
 
 def _make_dataset_specs(repo_root: Path, args: argparse.Namespace | None = None) -> list[DatasetSpec]:
@@ -508,61 +684,2553 @@ def make_figure_1(args: argparse.Namespace) -> Path:
     return output_path
 
 
-def make_figure_2(args: argparse.Namespace) -> Path:
+def match_network_predictions(
+    blob_positions_nm: np.ndarray,
+    hex_positions_nm: np.ndarray,
+    radius_nm: float,
+) -> dict[str, np.ndarray]:
+    """Maximum-cardinality one-to-one matching, then minimum total distance.
+
+    KD-trees restrict candidates to the physical radius. Dummy assignment columns
+    allow unmatched Blob-Net positions. Their cost exceeds the total possible
+    distance cost, so gaining a valid pair always takes priority over distance.
+    """
+    if not np.isfinite(radius_nm) or radius_nm <= 0:
+        raise ValueError('Matching radius must be positive and finite.')
+    blob = np.asarray(blob_positions_nm, dtype=np.float64).reshape(-1, 2)
+    hexnet = np.asarray(hex_positions_nm, dtype=np.float64).reshape(-1, 2)
+    if not np.isfinite(blob).all() or not np.isfinite(hexnet).all():
+        raise ValueError('Prediction coordinates must be finite.')
+    pairs = np.empty((0, 2), dtype=np.int64)
+    distances = np.empty(0, dtype=np.float64)
+    if len(blob) and len(hexnet):
+        penalty = float(min(len(blob), len(hexnet)) + 1)
+        costs = np.full((len(blob), len(hexnet) + len(blob)), 2 * penalty)
+        costs[:, len(hexnet):] = penalty
+        neighbors = cKDTree(blob).query_ball_tree(cKDTree(hexnet), r=radius_nm)
+        for row, columns in enumerate(neighbors):
+            if columns:
+                costs[row, columns] = np.linalg.norm(hexnet[columns] - blob[row], axis=1) / radius_nm
+        rows, columns = linear_sum_assignment(costs)
+        valid = (columns < len(hexnet)) & (costs[rows, columns] <= 1.0 + 1e-12)
+        pairs = np.column_stack((rows[valid], columns[valid]))
+        distances = np.linalg.norm(blob[pairs[:, 0]] - hexnet[pairs[:, 1]], axis=1)
+    return {
+        'pairs': pairs,
+        'distances_nm': distances,
+        'blob_only_indices': np.setdiff1d(np.arange(len(blob)), pairs[:, 0]),
+        'hex_only_indices': np.setdiff1d(np.arange(len(hexnet)), pairs[:, 1]),
+    }
+
+
+def make_figure_3(args: argparse.Namespace) -> Path:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
     model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
-    measurements = _read_experimental_feature_measurements(args.experimental_measurements)
+    hex_checkpoint = getattr(args, 'hexagonal_checkpoint',
+                             Path(__file__).resolve().parents[1] / 'outputs/manuscript_models/hexagonal/unet_best.pth')
+    hex_model = _load_blobnet_model(hex_checkpoint, device, args.num_filters, args.dropout)
+    match_radius_nm = getattr(args, 'agreement_radius_nm', 0.06)
+    category_colors = {
+        'Both': getattr(args, 'both_color', MODEL_COLORS['square']),
+        'Hex-Net only': getattr(args, 'hex_only_color', '#56B4E9'),
+        'Blob-Net only': getattr(args, 'blob_only_color', '#D55E00'),
+    }
 
+    fourth_image = getattr(
+        args, 'fourth_image',
+        args.data_dir / '0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+    )
     files = [
-        ('WS2 grain boundary', args.data_dir / 'WS2.emd'),
-        ('Quasicrystal', args.data_dir / 'QuasiCrystal.emd'),
+        ('WS$_2$', args.data_dir / 'WS2.emd'),
         ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
-        ('Twins overview', args.data_dir / 'TwinsOverview.emd'),
+        ('WS$_2$ (0063)', fourth_image),
+        ('Quasicrystal', args.quasicrystal_image),
     ]
-    images: list[tuple[str, np.ndarray, dict[str, float]]] = []
-    outputs: list[np.ndarray] = []
+    images: list[tuple[str, np.ndarray, dict[str, Any]]] = []
+    coordinates: list[np.ndarray] = []
+    category_coordinates: list[dict[str, np.ndarray]] = []
+    predictions: list[np.ndarray] = []
     for label, path in files:
-        image = _load_experimental_image(path)
-        model_input, transform = _make_feature_matched_experimental_view(
+        velox_selection = None
+        if path == fourth_image:
+            image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+                path, args.experimental_crop_size,
+            )
+        else:
+            image = _load_experimental_image(path)
+            source_pixel_size_nm = _read_channel_pixel_size_nm(path)
+        field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+        native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+        display_view, native_view, transform = _make_fixed_fov_resolution_view(
             image,
-            measurements[path.stem],
             dog_small=args.dog_small,
             dog_large=args.dog_large,
-            target_sigma_px=args.feature_match_sigma_px,
-            crop_size=args.experimental_crop_size,
+            display_size=args.experimental_crop_size,
+            native_pixels=native_pixels,
         )
-        prediction = _predict_tiled(model, model_input, device, args.tile_size, args.tile_overlap, args.batch_size)
-        images.append((label, model_input, transform))
-        outputs.append(prediction)
+        native_prediction = _predict_tiled(
+            model,
+            native_view,
+            device,
+            args.tile_size,
+            args.tile_overlap,
+            args.batch_size,
+        )
+        native_coordinates = extract_subpixel_peak_positions(
+            native_prediction,
+            threshold_rel=args.localization_threshold_rel,
+            min_distance=args.peak_min_distance,
+            window_size=args.peak_window_size,
+        )
+        display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+        if len(display_coordinates):
+            display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+            display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+        hexagonal_pixel_size_factor = (
+            float(args.ws2_hexagonal_pixel_size_factor) if path.name == 'WS2.emd' else 1.0
+        )
+        hexagonal_target_pixel_size_nm = float(args.target_pixel_size_nm) * hexagonal_pixel_size_factor
+        hexagonal_native_pixels = max(1, int(round(field_of_view_nm / hexagonal_target_pixel_size_nm)))
+        hexagonal_native_view = (
+            native_view if hexagonal_native_pixels == native_pixels
+            else _normalize_image(_interpolate_image(
+                display_view, (hexagonal_native_pixels, hexagonal_native_pixels),
+            ))
+        )
+        hex_prediction = _predict_tiled(
+            hex_model, hexagonal_native_view, device, args.tile_size, args.tile_overlap, args.batch_size,
+        )
+        hexagonal_threshold_rel = (
+            float(args.ws2_hexagonal_threshold_rel)
+            if path.name == 'WS2.emd' else float(args.localization_threshold_rel)
+        )
+        hex_coordinates = np.asarray(extract_subpixel_peak_positions(
+            hex_prediction, threshold_rel=hexagonal_threshold_rel,
+            min_distance=args.peak_min_distance, window_size=args.peak_window_size,
+        ), dtype=np.float32).reshape(-1, 2)
+        if len(hex_coordinates):
+            hex_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(hexagonal_native_view.shape[0] - 1, 1)
+            hex_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(hexagonal_native_view.shape[1] - 1, 1)
+        blob_nm = display_coordinates.astype(np.float64) * source_pixel_size_nm
+        hex_nm = hex_coordinates.astype(np.float64) * source_pixel_size_nm
+        matching = match_network_predictions(blob_nm, hex_nm, match_radius_nm)
+        pairs = matching['pairs']
+        groups = {
+            'Both': (display_coordinates[pairs[:, 0]] + hex_coordinates[pairs[:, 1]]) / 2,
+            'Hex-Net only': hex_coordinates[matching['hex_only_indices']],
+            'Blob-Net only': display_coordinates[matching['blob_only_indices']],
+        }
+        category_coordinates.append(groups)
+        matching_summary = {
+            'radius_nm': float(match_radius_nm),
+            'method': 'KD-tree candidates; maximum-cardinality, minimum-total-distance one-to-one assignment.',
+            'shared_marker_position': 'Pair midpoint; agreement is not ground-truth correctness.',
+            'counts': {key: len(value) for key, value in groups.items()},
+            'category_colors': category_colors,
+            'category_markers': {'Both': 'open circle', 'Hex-Net only': 'x', 'Blob-Net only': 'x'},
+            'pairs_blob_hex_indices': pairs.tolist(),
+            'pair_distances_nm': matching['distances_nm'].tolist(),
+            'category_coordinates_yx_display_pixels': {key: value.tolist() for key, value in groups.items()},
+            'radius_sensitivity': [
+                {'radius_nm': radius, 'both_count': len(match_network_predictions(blob_nm, hex_nm, radius)['pairs'])}
+                for radius in (0.04, 0.06, 0.08)
+            ],
+        }
+        prediction = _interpolate_image(native_prediction, display_view.shape)
+        transform.update(
+            {
+                'source_pixel_size_nm': source_pixel_size_nm,
+                'target_pixel_size_nm': float(args.target_pixel_size_nm),
+                'field_of_view_nm': field_of_view_nm,
+                'predicted_atom_count': int(len(display_coordinates)),
+                'peak_coordinate_system': 'Peaks found on native NN output and mapped to the 512 px display FOV.',
+                'source_image': str(path),
+                'velox_selection': velox_selection,
+                'localization_threshold_rel': float(args.localization_threshold_rel),
+                'checkpoint': str(args.checkpoint),
+                'hexagonal_checkpoint': str(hex_checkpoint),
+                'hexagonal_pixel_size_factor': hexagonal_pixel_size_factor,
+                'hexagonal_target_pixel_size_nm': hexagonal_target_pixel_size_nm,
+                'hexagonal_native_inference_pixels': hexagonal_native_pixels,
+                'hexagonal_localization_threshold_rel': hexagonal_threshold_rel,
+                'hexagonal_predicted_atom_count': int(len(hex_coordinates)),
+                'matching': matching_summary,
+            }
+        )
+        images.append((label, display_view, transform))
+        coordinates.append(display_coordinates)
+        predictions.append(prediction)
 
-    fig, axes = plt.subplots(2, 4, figsize=(16, 7.2), constrained_layout=True)
-    for col, ((label, image, _transform), output) in enumerate(zip(images, outputs)):
-        _plot_clean_image(axes[0, col], image, '', cmap='gray')
-        axes[1, col].imshow(output, cmap=MODEL_CMAPS['random'], vmin=0.0, vmax=max(float(output.max()), 1e-6))
-        axes[1, col].set_xticks([])
-        axes[1, col].set_yticks([])
+    fig, axes = plt.subplots(2, len(images), figsize=(4 * len(images), 7.4), constrained_layout=True)
+    for col, ((label, image, _transform), groups) in enumerate(zip(images, category_coordinates)):
+        _plot_clean_image(axes[0, col], image, label, cmap='gray')
+        _plot_clean_image(axes[1, col], image, '', cmap='gray')
+        for category, atom_coordinates in groups.items():
+            if len(atom_coordinates):
+                style = (
+                    {'marker': 'o', 'facecolors': 'none', 'edgecolors': category_colors[category]}
+                    if category == 'Both' else {'marker': 'x', 'color': category_colors[category]}
+                )
+                axes[1, col].scatter(
+                    atom_coordinates[:, 1], atom_coordinates[:, 0], s=args.marker_size,
+                    linewidths=args.marker_linewidth, alpha=0.96, **style,
+                )
+        for row in range(2):
+            _add_physical_scale_bar(
+                axes[row, col],
+                image.shape,
+                pixel_size_nm=float(_transform['source_pixel_size_nm']),
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
 
-    output_path = output_dir / 'figure2_experimental_haadf_outputs.png'
+    fig.legend(
+        handles=[Line2D([0], [0], linestyle='none', marker='o' if category == 'Both' else 'x',
+                        markerfacecolor='none', markeredgecolor=color, markeredgewidth=args.marker_linewidth,
+                        markersize=8, label=category) for category, color in category_colors.items()],
+        loc='upper center', bbox_to_anchor=(0.5, 1.065), ncol=3, frameon=False, fontsize=AXIS_LABEL_SIZE,
+    )
+    output_path = output_dir / 'figure3_experimental_haadf_outputs.png'
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    if args.save_pdf:
+        figure_pdf_path = output_dir / 'figure3_experimental_haadf_outputs.pdf'
+        fig.savefig(figure_pdf_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
+
+    palette_options = [
+        ('A - Current', {'Both': '#2f69bf', 'Hex-Net only': '#56B4E9', 'Blob-Net only': '#D55E00'}),
+        ('B - Green / cyan / vermillion', {'Both': '#009E73', 'Hex-Net only': '#56B4E9', 'Blob-Net only': '#D55E00'}),
+        ('C - Yellow / blue / vermillion', {'Both': '#F0E442', 'Hex-Net only': '#0072B2', 'Blob-Net only': '#D55E00'}),
+        ('D - Manuscript model palette', {'Both': '#2f8f4e', 'Hex-Net only': '#dd7a1f', 'Blob-Net only': '#2f69bf'}),
+    ]
+    preview_index = next(i for i, (label, _image, _transform) in enumerate(images) if '0063' in label)
+    preview_image = images[preview_index][1]
+    preview_groups = category_coordinates[preview_index]
+    palette_fig, palette_axes = plt.subplots(2, 2, figsize=(11, 11), constrained_layout=True)
+    for axis, (palette_label, palette) in zip(palette_axes.reshape(-1), palette_options):
+        _plot_clean_image(axis, preview_image, palette_label, cmap='gray')
+        for category, atom_coordinates in preview_groups.items():
+            if not len(atom_coordinates):
+                continue
+            style = (
+                {'marker': 'o', 'facecolors': 'none', 'edgecolors': palette[category]}
+                if category == 'Both' else {'marker': 'x', 'color': palette[category]}
+            )
+            axis.scatter(
+                atom_coordinates[:, 1], atom_coordinates[:, 0], s=args.marker_size,
+                linewidths=args.marker_linewidth, alpha=0.96, **style,
+            )
+        _add_physical_scale_bar(
+            axis, preview_image.shape,
+            pixel_size_nm=float(images[preview_index][2]['source_pixel_size_nm']),
+            length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+        )
+        axis.legend(
+            handles=[Line2D([0], [0], linestyle='none', marker='o' if category == 'Both' else 'x',
+                            markerfacecolor='none', markeredgecolor=color,
+                            markeredgewidth=args.marker_linewidth, markersize=7, label=category)
+                     for category, color in palette.items()],
+            loc='lower left', ncol=1, frameon=True, facecolor='black', edgecolor='none',
+            framealpha=0.55, labelcolor='white', fontsize=8,
+        )
+    palette_path = output_dir / 'figure3_experimental_palette_options.png'
+    palette_fig.savefig(palette_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(palette_fig)
+    (output_dir / 'figure3_experimental_palette_options.json').write_text(json.dumps({
+        'preview_image': images[preview_index][0],
+        'marker_linewidth_points': float(args.marker_linewidth),
+        'options': [{'label': label, 'colors': colors} for label, colors in palette_options],
+    }, indent=2))
 
     summary = [
         {
             'label': label,
             'shape_y': int(image.shape[0]),
             'shape_x': int(image.shape[1]),
-            'display_processing': 'DoG background-subtracted, feature-sigma matched, center-cropped',
-            'target_sigma_px': float(args.feature_match_sigma_px),
             **transform,
-            'output_mean': float(output.mean()),
-            'output_max': float(output.max()),
+            'output_mean': float(prediction.mean()),
+            'output_max': float(prediction.max()),
+            'scale_bar_length_nm': float(args.scale_bar_length_nm),
         }
-        for (label, image, transform), output in zip(images, outputs)
+        for (label, image, transform), prediction in zip(images, predictions)
     ]
-    (output_dir / 'figure2_experimental_haadf_outputs.json').write_text(json.dumps(summary, indent=2))
+    (output_dir / 'figure3_experimental_haadf_outputs.json').write_text(json.dumps(summary, indent=2))
     return output_path
+
+
+def make_figure_3b(args: argparse.Namespace) -> Path:
+    """Compare Blob-Net and hexagonal-model atom localizations on Figure 3 images."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    models = [
+        (
+            'Blob-Net',
+            _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout),
+            args.blobnet_marker_color,
+        ),
+        (
+            'Hexagonal model',
+            _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout),
+            args.hexagonal_marker_color,
+        ),
+    ]
+    files = [
+        ('WS$_2$', args.data_dir / 'WS2.emd'),
+        ('Quasicrystal', args.quasicrystal_image),
+        ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
+    ]
+
+    images: list[tuple[str, np.ndarray, np.ndarray, dict[str, Any]]] = []
+    for label, path in files:
+        image = _load_experimental_image(path)
+        source_pixel_size_nm = _read_channel_pixel_size_nm(path)
+        field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+        native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+        display_view, native_view, transform = _make_fixed_fov_resolution_view(
+            image,
+            dog_small=args.dog_small,
+            dog_large=args.dog_large,
+            display_size=args.experimental_crop_size,
+            native_pixels=native_pixels,
+        )
+        transform.update(
+            {
+                'source_image': str(path),
+                'source_pixel_size_nm': source_pixel_size_nm,
+                'target_pixel_size_nm': float(args.target_pixel_size_nm),
+                'field_of_view_nm': field_of_view_nm,
+            }
+        )
+        images.append((label, display_view, native_view, transform))
+
+    model_coordinates: dict[str, list[np.ndarray]] = {}
+    model_records: dict[str, list[dict[str, Any]]] = {}
+    for model_label, model, marker_color in models:
+        coordinates_for_model: list[np.ndarray] = []
+        records_for_model: list[dict[str, Any]] = []
+        for (_label, display_view, native_view, transform) in images:
+            native_prediction = _predict_tiled(
+                model,
+                native_view,
+                device,
+                args.tile_size,
+                args.tile_overlap,
+                args.batch_size,
+            )
+            native_coordinates = extract_subpixel_peak_positions(
+                native_prediction,
+                threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            )
+            display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            coordinates_for_model.append(display_coordinates)
+            records_for_model.append(
+                {
+                    'source_image': transform['source_image'],
+                    'predicted_atom_count': int(len(display_coordinates)),
+                    'prediction_mean': float(native_prediction.mean()),
+                    'prediction_max': float(native_prediction.max()),
+                }
+            )
+        model_coordinates[model_label] = coordinates_for_model
+        model_records[model_label] = records_for_model
+
+    fig, axes = plt.subplots(3, 3, figsize=(12, 10.8), constrained_layout=True)
+    for col, (label, image, _native_view, transform) in enumerate(images):
+        _plot_clean_image(axes[0, col], image, label, cmap='gray')
+        _add_physical_scale_bar(
+            axes[0, col],
+            image.shape,
+            pixel_size_nm=float(transform['source_pixel_size_nm']),
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        for row, (model_label, _model, marker_color) in enumerate(models, start=1):
+            _plot_clean_image(axes[row, col], image, '', cmap='gray')
+            atom_coordinates = model_coordinates[model_label][col]
+            if len(atom_coordinates):
+                axes[row, col].scatter(
+                    atom_coordinates[:, 1],
+                    atom_coordinates[:, 0],
+                    s=args.marker_size,
+                    facecolors=marker_color,
+                    edgecolors=args.marker_edge_color,
+                    linewidths=args.marker_linewidth,
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axes[row, col],
+                image.shape,
+                pixel_size_nm=float(transform['source_pixel_size_nm']),
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+
+    axes[1, 0].set_ylabel('Blob-Net', fontsize=AXIS_LABEL_SIZE)
+    axes[2, 0].set_ylabel('Hexagonal model', fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'fig-Blob-Net-3b.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'field_of_view': 'Preserved independently for each image.',
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'scale_bar_length_nm': float(args.scale_bar_length_nm),
+        'marker_size_points_squared': float(args.marker_size),
+        'models': {
+            'Blob-Net': {
+                'checkpoint': str(args.blobnet_checkpoint),
+                'marker_color': args.blobnet_marker_color,
+                'records': model_records['Blob-Net'],
+            },
+            'Hexagonal model': {
+                'checkpoint': str(args.hexagonal_checkpoint),
+                'marker_color': args.hexagonal_marker_color,
+                'records': model_records['Hexagonal model'],
+            },
+        },
+        'images': [
+            {
+                'label': label,
+                **transform,
+            }
+            for label, _image, _native_view, transform in images
+        ],
+    }
+    (output_dir / 'fig-Blob-Net-3b.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c(args: argparse.Namespace) -> Path:
+    """Run the Figure 3b comparison on four displayed multi-frame Velox HAADF images."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    models = [
+        (
+            'Blob-Net',
+            _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout),
+            args.blobnet_marker_color,
+        ),
+        (
+            'Hexagonal model',
+            _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout),
+            args.hexagonal_marker_color,
+        ),
+    ]
+
+    images: list[tuple[str, np.ndarray, np.ndarray, dict[str, Any]]] = []
+    for path in args.images:
+        image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+            path,
+            args.experimental_crop_size,
+        )
+        field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+        native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+        display_view, native_view, transform = _make_fixed_fov_resolution_view(
+            image,
+            dog_small=args.dog_small,
+            dog_large=args.dog_large,
+            display_size=args.experimental_crop_size,
+            native_pixels=native_pixels,
+        )
+        transform.update(
+            {
+                'source_image': str(path),
+                'source_pixel_size_nm': source_pixel_size_nm,
+                'target_pixel_size_nm': float(args.target_pixel_size_nm),
+                'field_of_view_nm': field_of_view_nm,
+                'velox_selection': velox_selection,
+            }
+        )
+        images.append((path.name.split(' - ')[0], display_view, native_view, transform))
+
+    model_coordinates: dict[str, list[np.ndarray]] = {}
+    model_records: dict[str, list[dict[str, Any]]] = {}
+    for model_label, model, _marker_color in models:
+        coordinates_for_model: list[np.ndarray] = []
+        records_for_model: list[dict[str, Any]] = []
+        for _label, display_view, native_view, transform in images:
+            native_prediction = _predict_tiled(
+                model,
+                native_view,
+                device,
+                args.tile_size,
+                args.tile_overlap,
+                args.batch_size,
+            )
+            native_coordinates = extract_subpixel_peak_positions(
+                native_prediction,
+                threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            )
+            display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            coordinates_for_model.append(display_coordinates)
+            records_for_model.append(
+                {
+                    'source_image': transform['source_image'],
+                    'predicted_atom_count': int(len(display_coordinates)),
+                    'prediction_mean': float(native_prediction.mean()),
+                    'prediction_max': float(native_prediction.max()),
+                }
+            )
+        model_coordinates[model_label] = coordinates_for_model
+        model_records[model_label] = records_for_model
+
+    fig, axes = plt.subplots(3, len(images), figsize=(15.8, 10.8), constrained_layout=True)
+    for col, (label, image, _native_view, transform) in enumerate(images):
+        _plot_clean_image(axes[0, col], image, label, cmap='gray')
+        _add_physical_scale_bar(
+            axes[0, col],
+            image.shape,
+            pixel_size_nm=float(transform['source_pixel_size_nm']),
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        for row, (model_label, _model, marker_color) in enumerate(models, start=1):
+            _plot_clean_image(axes[row, col], image, '', cmap='gray')
+            atom_coordinates = model_coordinates[model_label][col]
+            if len(atom_coordinates):
+                axes[row, col].scatter(
+                    atom_coordinates[:, 1],
+                    atom_coordinates[:, 0],
+                    s=args.marker_size,
+                    facecolors=marker_color,
+                    edgecolors=args.marker_edge_color,
+                    linewidths=args.marker_linewidth,
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axes[row, col],
+                image.shape,
+                pixel_size_nm=float(transform['source_pixel_size_nm']),
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+
+    axes[1, 0].set_ylabel('Blob-Net', fontsize=AXIS_LABEL_SIZE)
+    axes[2, 0].set_ylabel('Hexagonal model', fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'fig-Blob-Net-3c.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'image_selection': 'Final displayed DCFI(HAADF) series frame, with HAADF fallback.',
+        'field_of_view': 'Centered 512 x 512 source-pixel FOV preserved independently for each image.',
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'scale_bar_length_nm': float(args.scale_bar_length_nm),
+        'marker_size_points_squared': float(args.marker_size),
+        'models': {
+            'Blob-Net': {
+                'checkpoint': str(args.blobnet_checkpoint),
+                'marker_color': args.blobnet_marker_color,
+                'records': model_records['Blob-Net'],
+            },
+            'Hexagonal model': {
+                'checkpoint': str(args.hexagonal_checkpoint),
+                'marker_color': args.hexagonal_marker_color,
+                'records': model_records['Hexagonal model'],
+            },
+        },
+        'images': [
+            {
+                'label': label,
+                **transform,
+            }
+            for label, _image, _native_view, transform in images
+        ],
+    }
+    (output_dir / 'fig-Blob-Net-3c.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_cutoff_sweep(args: argparse.Namespace) -> Path:
+    """Sweep peak cutoffs for both Figure 3C models on one Velox HAADF image."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    models = [
+        (
+            'Blob-Net',
+            _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout),
+            args.blobnet_marker_color,
+        ),
+        (
+            'Hexagonal model',
+            _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout),
+            args.hexagonal_marker_color,
+        ),
+    ]
+
+    if getattr(args, 'standard_emd', False):
+        image = _load_experimental_image(args.image)
+        source_pixel_size_nm = _read_channel_pixel_size_nm(args.image)
+        velox_selection = None
+    else:
+        image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+            args.image,
+            args.experimental_crop_size,
+        )
+    image_label = args.image.stem.split(' - ')[0].replace(' ', '-').replace('_', '-')
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+    display_view, native_view, transform = _make_fixed_fov_resolution_view(
+        image,
+        dog_small=args.dog_small,
+        dog_large=args.dog_large,
+        display_size=args.experimental_crop_size,
+        native_pixels=native_pixels,
+    )
+    cutoffs = np.linspace(args.cutoff_min, args.cutoff_max, args.steps, dtype=np.float64)
+
+    coordinates: dict[str, list[np.ndarray]] = {}
+    records: dict[str, list[dict[str, Any]]] = {}
+    for model_label, model, _marker_color in models:
+        native_prediction = _predict_tiled(
+            model,
+            native_view,
+            device,
+            args.tile_size,
+            args.tile_overlap,
+            args.batch_size,
+        )
+        model_coordinates: list[np.ndarray] = []
+        model_records: list[dict[str, Any]] = []
+        for cutoff in cutoffs:
+            native_coordinates = extract_subpixel_peak_positions(
+                native_prediction,
+                threshold_rel=float(cutoff),
+                min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            )
+            display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            model_coordinates.append(display_coordinates)
+            model_records.append(
+                {
+                    'cutoff': float(cutoff),
+                    'predicted_atom_count': int(len(display_coordinates)),
+                }
+            )
+        coordinates[model_label] = model_coordinates
+        records[model_label] = model_records
+
+    fig = plt.figure(figsize=(3.0 + 2.25 * len(cutoffs), 5.5), constrained_layout=True)
+    grid = fig.add_gridspec(2, len(cutoffs) + 1, width_ratios=[1.14] + [1.0] * len(cutoffs))
+    input_axis = fig.add_subplot(grid[:, 0])
+    _plot_clean_image(input_axis, display_view, args.image.name.split(' - ')[0], cmap='gray')
+    _add_physical_scale_bar(
+        input_axis,
+        display_view.shape,
+        pixel_size_nm=source_pixel_size_nm,
+        length_nm=float(args.scale_bar_length_nm),
+        linewidth=float(args.scale_bar_linewidth),
+    )
+
+    for row, (model_label, _model, marker_color) in enumerate(models):
+        for col, cutoff in enumerate(cutoffs, start=1):
+            axis = fig.add_subplot(grid[row, col])
+            _plot_clean_image(axis, display_view, '', cmap='gray')
+            atom_coordinates = coordinates[model_label][col - 1]
+            if len(atom_coordinates):
+                axis.scatter(
+                    atom_coordinates[:, 1],
+                    atom_coordinates[:, 0],
+                    s=args.marker_size,
+                    facecolors=marker_color,
+                    edgecolors=args.marker_edge_color,
+                    linewidths=args.marker_linewidth,
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axis,
+                display_view.shape,
+                pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+            if row == 0:
+                axis.set_title(f'Cutoff {cutoff:.2f}', fontsize=11)
+            axis.text(
+                0.04,
+                0.04,
+                f'n={len(atom_coordinates)}',
+                transform=axis.transAxes,
+                color='white',
+                fontsize=8,
+                ha='left',
+                va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+            )
+            if col == 1:
+                axis.set_ylabel(model_label, fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'fig-Blob-Net-3c-0063-cutoff-sweep.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'source_image': str(args.image),
+        'image_selection': 'Final displayed DCFI(HAADF) series frame.',
+        'velox_selection': velox_selection,
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm,
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'native_inference_pixels': native_pixels,
+        'cutoff_range': [float(args.cutoff_min), float(args.cutoff_max)],
+        'steps': int(args.steps),
+        'models': {
+            'Blob-Net': {
+                'checkpoint': str(args.blobnet_checkpoint),
+                'marker_color': args.blobnet_marker_color,
+                'records': records['Blob-Net'],
+            },
+            'Hexagonal model': {
+                'checkpoint': str(args.hexagonal_checkpoint),
+                'marker_color': args.hexagonal_marker_color,
+                'records': records['Hexagonal model'],
+            },
+        },
+        'processing': transform,
+    }
+    (output_dir / 'fig-Blob-Net-3c-0063-cutoff-sweep.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_agreement_cutoff_sweep(args: argparse.Namespace) -> Path:
+    """Sweep both model cutoffs and classify their one-to-one agreement."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    blob_model = _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout)
+    hex_model = _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout)
+    if getattr(args, 'standard_emd', False):
+        image = _load_experimental_image(args.image)
+        source_pixel_size_nm = _read_channel_pixel_size_nm(args.image)
+        velox_selection = None
+    else:
+        image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+            args.image, args.experimental_crop_size,
+        )
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+    display_view, native_view, transform = _make_fixed_fov_resolution_view(
+        image, dog_small=args.dog_small, dog_large=args.dog_large,
+        display_size=args.experimental_crop_size, native_pixels=native_pixels,
+    )
+    blob_prediction = _predict_tiled(
+        blob_model, native_view, device, args.tile_size, args.tile_overlap, args.batch_size,
+    )
+    hex_prediction = _predict_tiled(
+        hex_model, native_view, device, args.tile_size, args.tile_overlap, args.batch_size,
+    )
+    cutoffs = (
+        np.asarray(args.cutoffs, dtype=np.float64)
+        if args.cutoffs is not None
+        else np.linspace(args.cutoff_min, args.cutoff_max, args.steps, dtype=np.float64)
+    )
+    category_colors = {
+        'Both': args.both_color,
+        'Hex-Net only': args.hex_only_color,
+        'Blob-Net only': args.blob_only_color,
+    }
+    records: list[dict[str, Any]] = []
+    category_coordinates: list[dict[str, np.ndarray]] = []
+    for cutoff in cutoffs:
+        model_coordinates: list[np.ndarray] = []
+        for model_index, prediction in enumerate((blob_prediction, hex_prediction)):
+            model_cutoff = (
+                float(args.fixed_blobnet_cutoff)
+                if model_index == 0 and args.fixed_blobnet_cutoff is not None
+                else float(cutoff)
+            )
+            native_coordinates = np.asarray(extract_subpixel_peak_positions(
+                prediction, threshold_rel=model_cutoff, min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            ), dtype=np.float32).reshape(-1, 2)
+            display_coordinates = native_coordinates.copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            model_coordinates.append(display_coordinates)
+        blob_coordinates, hex_coordinates = model_coordinates
+        matching = match_network_predictions(
+            blob_coordinates.astype(np.float64) * source_pixel_size_nm,
+            hex_coordinates.astype(np.float64) * source_pixel_size_nm,
+            args.agreement_radius_nm,
+        )
+        pairs = matching['pairs']
+        groups = {
+            'Both': (blob_coordinates[pairs[:, 0]] + hex_coordinates[pairs[:, 1]]) / 2,
+            'Hex-Net only': hex_coordinates[matching['hex_only_indices']],
+            'Blob-Net only': blob_coordinates[matching['blob_only_indices']],
+        }
+        category_coordinates.append(groups)
+        records.append({
+            'cutoff': float(cutoff),
+            'blobnet_cutoff': (
+                float(cutoff) if args.fixed_blobnet_cutoff is None else float(args.fixed_blobnet_cutoff)
+            ),
+            'hexnet_cutoff': float(cutoff),
+            'blob_count': int(len(blob_coordinates)),
+            'hex_count': int(len(hex_coordinates)),
+            'category_counts': {key: int(len(value)) for key, value in groups.items()},
+            'pair_distances_nm': matching['distances_nm'].tolist(),
+        })
+
+    panel_count = len(cutoffs) + 1
+    columns = 4
+    rows = int(math.ceil(panel_count / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(3.35 * columns, 3.35 * rows), constrained_layout=True)
+    flat_axes = np.asarray(axes).reshape(-1)
+    _plot_clean_image(flat_axes[0], display_view, 'Input', cmap='gray')
+    _add_physical_scale_bar(
+        flat_axes[0], display_view.shape, pixel_size_nm=source_pixel_size_nm,
+        length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+    )
+    for axis, cutoff, groups, record in zip(flat_axes[1:], cutoffs, category_coordinates, records):
+        title = f'Cutoff {cutoff:.2f}'
+        if args.fixed_blobnet_cutoff is not None:
+            title = f'Hex cutoff {cutoff:.2f}\nBlob cutoff {args.fixed_blobnet_cutoff:.2f}'
+        _plot_clean_image(axis, display_view, title, cmap='gray')
+        for category, atom_coordinates in groups.items():
+            if not len(atom_coordinates):
+                continue
+            style = (
+                {'marker': 'o', 'facecolors': 'none', 'edgecolors': category_colors[category]}
+                if category == 'Both' else {'marker': 'x', 'color': category_colors[category]}
+            )
+            axis.scatter(
+                atom_coordinates[:, 1], atom_coordinates[:, 0], s=args.marker_size,
+                linewidths=args.marker_linewidth, alpha=0.96, **style,
+            )
+        _add_physical_scale_bar(
+            axis, display_view.shape, pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+        )
+        counts = record['category_counts']
+        axis.text(
+            0.03, 0.035,
+            f"Both {counts['Both']} | H {counts['Hex-Net only']} | B {counts['Blob-Net only']}",
+            transform=axis.transAxes, color='white', fontsize=7.5, ha='left', va='bottom',
+            bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.48, 'pad': 1.2},
+        )
+    for axis in flat_axes[panel_count:]:
+        axis.axis('off')
+    fig.legend(
+        handles=[Line2D([0], [0], linestyle='none', marker='o' if category == 'Both' else 'x',
+                        markerfacecolor='none', markeredgecolor=color,
+                        markeredgewidth=args.marker_linewidth, markersize=8, label=category)
+                 for category, color in category_colors.items()],
+        loc='upper center', bbox_to_anchor=(0.5, 1.10), ncol=3, frameon=False, fontsize=AXIS_LABEL_SIZE,
+    )
+    image_label = args.image.stem.split(' - ')[0].replace(' ', '-').replace('_', '-')
+    sweep_label = 'hex-only-threshold-sweep' if args.fixed_blobnet_cutoff is not None else 'cutoff-sweep'
+    output_path = output_dir / f'fig-Blob-Net-3-{image_label}-agreement-{sweep_label}.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+    summary = {
+        'figure': str(output_path), 'source_image': str(args.image),
+        'velox_selection': velox_selection, 'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm, 'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'native_inference_pixels': native_pixels, 'agreement_radius_nm': float(args.agreement_radius_nm),
+        'blobnet_fixed_cutoff': (
+            None if args.fixed_blobnet_cutoff is None else float(args.fixed_blobnet_cutoff)
+        ),
+        'cutoffs': [float(value) for value in cutoffs], 'category_colors': category_colors,
+        'category_markers': {'Both': 'open circle', 'Hex-Net only': 'x', 'Blob-Net only': 'x'},
+        'records': records, 'processing': transform,
+        'blobnet_checkpoint': str(args.blobnet_checkpoint),
+        'hexagonal_checkpoint': str(args.hexagonal_checkpoint),
+    }
+    output_path.with_suffix('.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_normalization_sweep(args: argparse.Namespace) -> Path:
+    """Sweep robust upper-percentile clipping for the Figure 3C 0063 crop."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    blob_model = _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout)
+    hex_model = _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout)
+    image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+        args.image, args.experimental_crop_size,
+    )
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+    processed = gaussian_filter(image, args.dog_small) - gaussian_filter(image, args.dog_large)
+    upper_percentiles = np.asarray(args.upper_percentiles, dtype=np.float64)
+    gammas = (
+        np.ones(len(upper_percentiles), dtype=np.float64)
+        if args.gammas is None else np.asarray(args.gammas, dtype=np.float64)
+    )
+    if len(gammas) != len(upper_percentiles):
+        raise ValueError('--gammas must contain one value per --upper-percentiles value.')
+    records: list[dict[str, Any]] = []
+    display_views: list[np.ndarray] = []
+    category_coordinates: list[dict[str, np.ndarray]] = []
+    category_colors = {
+        'Both': args.both_color,
+        'Hex-Net only': args.hex_only_color,
+        'Blob-Net only': args.blob_only_color,
+    }
+    for upper_percentile, gamma in zip(upper_percentiles, gammas):
+        lower_value, upper_value = np.percentile(
+            processed, [args.lower_percentile, float(upper_percentile)],
+        )
+        normalized = _normalize_image(
+            processed, low=args.lower_percentile, high=float(upper_percentile),
+        )
+        display_view = _center_crop_or_pad(normalized, args.experimental_crop_size)
+        native_view = _normalize_image(
+            _interpolate_image(display_view, (native_pixels, native_pixels)),
+            low=args.lower_percentile, high=float(upper_percentile),
+        )
+        display_view = np.power(np.clip(display_view, 0.0, 1.0), float(gamma)).astype(np.float32)
+        native_view = np.power(np.clip(native_view, 0.0, 1.0), float(gamma)).astype(np.float32)
+        display_views.append(display_view)
+        model_coordinates: list[np.ndarray] = []
+        for model in (blob_model, hex_model):
+            prediction = _predict_tiled(
+                model, native_view, device, args.tile_size, args.tile_overlap, args.batch_size,
+            )
+            native_coordinates = np.asarray(extract_subpixel_peak_positions(
+                prediction, threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance, window_size=args.peak_window_size,
+            ), dtype=np.float32).reshape(-1, 2)
+            display_coordinates = native_coordinates.copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_pixels - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_pixels - 1, 1)
+            model_coordinates.append(display_coordinates)
+        blob_coordinates, hex_coordinates = model_coordinates
+        matching = match_network_predictions(
+            blob_coordinates.astype(np.float64) * source_pixel_size_nm,
+            hex_coordinates.astype(np.float64) * source_pixel_size_nm,
+            args.agreement_radius_nm,
+        )
+        pairs = matching['pairs']
+        groups = {
+            'Both': (blob_coordinates[pairs[:, 0]] + hex_coordinates[pairs[:, 1]]) / 2,
+            'Hex-Net only': hex_coordinates[matching['hex_only_indices']],
+            'Blob-Net only': blob_coordinates[matching['blob_only_indices']],
+        }
+        category_coordinates.append(groups)
+        records.append({
+            'lower_percentile': float(args.lower_percentile),
+            'upper_percentile': float(upper_percentile),
+            'gamma': float(gamma),
+            'lower_clip_value': float(lower_value),
+            'upper_clip_value': float(upper_value),
+            'blob_count': int(len(blob_coordinates)),
+            'hex_count': int(len(hex_coordinates)),
+            'category_counts': {key: int(len(value)) for key, value in groups.items()},
+            'pair_distances_nm': matching['distances_nm'].tolist(),
+        })
+
+    columns = len(upper_percentiles)
+    fig, axes = plt.subplots(2, columns, figsize=(3.0 * columns, 6.0), constrained_layout=True)
+    axes = np.asarray(axes).reshape(2, columns)
+    for column, (upper_percentile, gamma, display_view, groups, record) in enumerate(zip(
+        upper_percentiles, gammas, display_views, category_coordinates, records,
+    )):
+        title = f'Upper clip {upper_percentile:g}%'
+        if not np.allclose(gammas, 1.0):
+            title += f'\nGamma {gamma:g}'
+        _plot_clean_image(axes[0, column], display_view, title, cmap='gray')
+        _add_physical_scale_bar(
+            axes[0, column], display_view.shape, pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+        )
+        _plot_clean_image(axes[1, column], display_view, None, cmap='gray')
+        for category, atom_coordinates in groups.items():
+            if not len(atom_coordinates):
+                continue
+            style = (
+                {'marker': 'o', 'facecolors': 'none', 'edgecolors': category_colors[category]}
+                if category == 'Both' else {'marker': 'x', 'color': category_colors[category]}
+            )
+            axes[1, column].scatter(
+                atom_coordinates[:, 1], atom_coordinates[:, 0], s=args.marker_size,
+                linewidths=args.marker_linewidth, alpha=0.96, **style,
+            )
+        _add_physical_scale_bar(
+            axes[1, column], display_view.shape, pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+        )
+        counts = record['category_counts']
+        axes[1, column].text(
+            0.03, 0.035,
+            f"Both {counts['Both']} | H {counts['Hex-Net only']} | B {counts['Blob-Net only']}",
+            transform=axes[1, column].transAxes, color='white', fontsize=7.5,
+            ha='left', va='bottom',
+            bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.48, 'pad': 1.2},
+        )
+    fig.legend(
+        handles=[Line2D([0], [0], linestyle='none', marker='o' if category == 'Both' else 'x',
+                        markerfacecolor='none', markeredgecolor=color,
+                        markeredgewidth=args.marker_linewidth, markersize=8, label=category)
+                 for category, color in category_colors.items()],
+        loc='upper center', bbox_to_anchor=(0.5, 1.08), ncol=3,
+        frameon=False, fontsize=AXIS_LABEL_SIZE,
+    )
+    output_path = output_dir / 'fig-Blob-Net-3c-0063-normalization-sweep.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+    summary = {
+        'figure': str(output_path), 'source_image': str(args.image),
+        'velox_selection': velox_selection, 'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm, 'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'native_inference_pixels': native_pixels,
+        'localization_threshold_rel': float(args.localization_threshold_rel),
+        'agreement_radius_nm': float(args.agreement_radius_nm),
+        'normalization': 'DoG followed by lower/upper percentile clipping and linear scaling to [0, 1]',
+        'upper_percentiles': [float(value) for value in upper_percentiles],
+        'gammas': [float(value) for value in gammas],
+        'category_colors': category_colors,
+        'category_markers': {'Both': 'open circle', 'Hex-Net only': 'x', 'Blob-Net only': 'x'},
+        'records': records,
+        'blobnet_checkpoint': str(args.blobnet_checkpoint),
+        'hexagonal_checkpoint': str(args.hexagonal_checkpoint),
+    }
+    output_path.with_suffix('.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_pixel_size_sweep(args: argparse.Namespace) -> Path:
+    """Sweep physical pixel size for both Figure 3C models on one Velox HAADF image."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    models = [
+        (
+            'Blob-Net',
+            _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout),
+            args.blobnet_marker_color,
+        ),
+        (
+            'Hexagonal model',
+            _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout),
+            args.hexagonal_marker_color,
+        ),
+    ]
+
+    if getattr(args, 'standard_emd', False):
+        image = _load_experimental_image(args.image)
+        source_pixel_size_nm = _read_channel_pixel_size_nm(args.image)
+        velox_selection = None
+    else:
+        image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+            args.image,
+            args.experimental_crop_size,
+        )
+    image_label = args.image.stem.split(' - ')[0].replace(' ', '-').replace('_', '-')
+    processed = gaussian_filter(image, args.dog_small) - gaussian_filter(image, args.dog_large)
+    display_view = _center_crop_or_pad(_normalize_image(processed), args.experimental_crop_size)
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    factors = np.asarray(args.pixel_size_factors, dtype=np.float64)
+
+    native_views: list[np.ndarray] = []
+    scale_records: list[dict[str, Any]] = []
+    for factor in factors:
+        target_pixel_size_nm = float(args.base_pixel_size_nm) * float(factor)
+        native_pixels = max(1, int(round(field_of_view_nm / target_pixel_size_nm)))
+        native_views.append(
+            _normalize_image(_interpolate_image(display_view, (native_pixels, native_pixels)))
+        )
+        scale_records.append(
+            {
+                'factor': float(factor),
+                'target_pixel_size_nm': target_pixel_size_nm,
+                'native_inference_pixels': native_pixels,
+            }
+        )
+
+    fixed_blobnet_view: np.ndarray | None = None
+    fixed_blobnet_record: dict[str, Any] | None = None
+    if args.fixed_blobnet_factor is not None:
+        fixed_target_pixel_size_nm = float(args.base_pixel_size_nm) * float(args.fixed_blobnet_factor)
+        fixed_native_pixels = max(1, int(round(field_of_view_nm / fixed_target_pixel_size_nm)))
+        fixed_blobnet_view = _normalize_image(
+            _interpolate_image(display_view, (fixed_native_pixels, fixed_native_pixels))
+        )
+        fixed_blobnet_record = {
+            'factor': float(args.fixed_blobnet_factor),
+            'target_pixel_size_nm': fixed_target_pixel_size_nm,
+            'native_inference_pixels': fixed_native_pixels,
+        }
+
+    coordinates: dict[str, list[np.ndarray]] = {}
+    model_records: dict[str, list[dict[str, Any]]] = {}
+    for model_label, model, _marker_color in models:
+        coordinates_for_model: list[np.ndarray] = []
+        records_for_model: list[dict[str, Any]] = []
+        for native_view, scale_record in zip(native_views, scale_records):
+            inference_view = (
+                fixed_blobnet_view
+                if model_label == 'Blob-Net' and fixed_blobnet_view is not None
+                else native_view
+            )
+            effective_scale_record = (
+                fixed_blobnet_record
+                if model_label == 'Blob-Net' and fixed_blobnet_record is not None
+                else scale_record
+            )
+            native_prediction = _predict_tiled(
+                model,
+                inference_view,
+                device,
+                args.tile_size,
+                args.tile_overlap,
+                args.batch_size,
+            )
+            native_coordinates = extract_subpixel_peak_positions(
+                native_prediction,
+                threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            )
+            display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(inference_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(inference_view.shape[1] - 1, 1)
+            coordinates_for_model.append(display_coordinates)
+            records_for_model.append(
+                {
+                    **effective_scale_record,
+                    'comparison_factor': float(scale_record['factor']),
+                    'predicted_atom_count': int(len(display_coordinates)),
+                    'prediction_mean': float(native_prediction.mean()),
+                    'prediction_max': float(native_prediction.max()),
+                }
+            )
+        coordinates[model_label] = coordinates_for_model
+        model_records[model_label] = records_for_model
+
+    fig = plt.figure(figsize=(3.2 + 4.0 * len(factors), 7.1), constrained_layout=True)
+    grid = fig.add_gridspec(2, len(factors) + 1, width_ratios=[1.08] + [1.0] * len(factors))
+    input_axis = fig.add_subplot(grid[:, 0])
+    _plot_clean_image(input_axis, display_view, args.image.name.split(' - ')[0], cmap='gray')
+    _add_physical_scale_bar(
+        input_axis,
+        display_view.shape,
+        pixel_size_nm=source_pixel_size_nm,
+        length_nm=float(args.scale_bar_length_nm),
+        linewidth=float(args.scale_bar_linewidth),
+    )
+
+    for row, (model_label, _model, marker_color) in enumerate(models):
+        for col, scale_record in enumerate(scale_records, start=1):
+            axis = fig.add_subplot(grid[row, col])
+            _plot_clean_image(axis, display_view, '', cmap='gray')
+            atom_coordinates = coordinates[model_label][col - 1]
+            if len(atom_coordinates):
+                axis.scatter(
+                    atom_coordinates[:, 1],
+                    atom_coordinates[:, 0],
+                    s=args.marker_size,
+                    facecolors=marker_color,
+                    edgecolors=args.marker_edge_color,
+                    linewidths=args.marker_linewidth,
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axis,
+                display_view.shape,
+                pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+            if row == 0:
+                axis.set_title(
+                    f"{scale_record['factor']:.2f}x | {scale_record['target_pixel_size_nm']:.5f} nm/px\n"
+                    f"{scale_record['native_inference_pixels']} px inference",
+                    fontsize=11,
+                )
+            axis.text(
+                0.04,
+                0.04,
+                f'n={len(atom_coordinates)}',
+                transform=axis.transAxes,
+                color='white',
+                fontsize=9,
+                ha='left',
+                va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+            )
+            if col == 1:
+                axis.set_ylabel(model_label, fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'fig-Blob-Net-3c-0063-pixel-size-sweep.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    if args.combined_overlay:
+        fig, axes = plt.subplots(1, len(factors), figsize=(6.4 * len(factors), 6.4), constrained_layout=True)
+        for col, (axis, scale_record) in enumerate(zip(np.asarray(axes).reshape(-1), scale_records)):
+            _plot_clean_image(
+                axis, display_view,
+                f"{scale_record['factor']:.2f}x | {scale_record['target_pixel_size_nm']:.5f} nm/px\n"
+                f"{scale_record['native_inference_pixels']} x {scale_record['native_inference_pixels']} inference grid",
+                cmap='gray',
+            )
+            blob_coordinates = coordinates['Blob-Net'][col]
+            hex_coordinates = coordinates['Hexagonal model'][col]
+            if len(blob_coordinates):
+                axis.scatter(
+                    blob_coordinates[:, 1], blob_coordinates[:, 0], s=args.marker_size,
+                    marker='o', facecolors='none', edgecolors=args.blobnet_marker_color,
+                    linewidths=1.05, zorder=3,
+                )
+            if len(hex_coordinates):
+                axis.scatter(
+                    hex_coordinates[:, 1], hex_coordinates[:, 0], s=float(args.marker_size) * 0.72,
+                    marker='x', color=args.comparison_hexagonal_marker_color, linewidths=1.05, zorder=4,
+                )
+            _add_physical_scale_bar(
+                axis, display_view.shape, pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+            )
+            axis.text(
+                0.04, 0.04, f'B={len(blob_coordinates)}  H={len(hex_coordinates)}',
+                transform=axis.transAxes, color='white', fontsize=9, ha='left', va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+            )
+        fig.legend(
+            handles=[
+                Line2D([0], [0], linestyle='none', marker='o', markerfacecolor='none',
+                       markeredgecolor=args.blobnet_marker_color, markeredgewidth=1.05,
+                       markersize=8, label='Blob-Net'),
+                Line2D([0], [0], linestyle='none', marker='x', color=args.comparison_hexagonal_marker_color,
+                       markeredgewidth=1.4, markersize=8, label='Hexagonal model'),
+            ],
+            loc='upper center', bbox_to_anchor=(0.5, 1.08), ncol=2, frameon=False, fontsize=AXIS_LABEL_SIZE,
+        )
+        output_path = output_dir / f'fig-Blob-Net-3c-{image_label}-combined-pixel-size-sweep.png'
+        fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+        plt.close(fig)
+
+    agreement_records: list[dict[str, Any]] = []
+    if args.agreement_overlay:
+        category_colors = {
+            'Both': args.both_color,
+            'Hex-Net only': args.hex_only_color,
+            'Blob-Net only': args.blob_only_color,
+        }
+        category_coordinates: list[dict[str, np.ndarray]] = []
+        for col, scale_record in enumerate(scale_records):
+            blob_coordinates = coordinates['Blob-Net'][col]
+            hex_coordinates = coordinates['Hexagonal model'][col]
+            matching = match_network_predictions(
+                blob_coordinates.astype(np.float64) * source_pixel_size_nm,
+                hex_coordinates.astype(np.float64) * source_pixel_size_nm,
+                args.agreement_radius_nm,
+            )
+            pairs = matching['pairs']
+            groups = {
+                'Both': (blob_coordinates[pairs[:, 0]] + hex_coordinates[pairs[:, 1]]) / 2,
+                'Hex-Net only': hex_coordinates[matching['hex_only_indices']],
+                'Blob-Net only': blob_coordinates[matching['blob_only_indices']],
+            }
+            category_coordinates.append(groups)
+            agreement_records.append({
+                **scale_record,
+                'blob_count': int(len(blob_coordinates)),
+                'hex_count': int(len(hex_coordinates)),
+                'category_counts': {key: int(len(value)) for key, value in groups.items()},
+                'pair_distances_nm': matching['distances_nm'].tolist(),
+            })
+
+        panel_count = len(factors) + 1
+        columns = 4
+        rows = int(math.ceil(panel_count / columns))
+        fig, axes = plt.subplots(
+            rows, columns, figsize=(3.35 * columns, 3.35 * rows), constrained_layout=True,
+        )
+        flat_axes = np.asarray(axes).reshape(-1)
+        _plot_clean_image(flat_axes[0], display_view, 'Input', cmap='gray')
+        _add_physical_scale_bar(
+            flat_axes[0], display_view.shape, pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+        )
+        for axis, groups, record in zip(flat_axes[1:], category_coordinates, agreement_records):
+            if args.fixed_blobnet_factor is None:
+                title = (
+                    f"{record['factor']:.2f}x current | {record['target_pixel_size_nm']:.5f} nm/px\n"
+                    f"{record['native_inference_pixels']} px inference"
+                )
+            else:
+                title = (
+                    f"Hex {record['factor']:.2f}x | Blob {args.fixed_blobnet_factor:.2f}x\n"
+                    f"Hex {record['native_inference_pixels']} px inference"
+                )
+            _plot_clean_image(axis, display_view, title, cmap='gray')
+            for category, atom_coordinates in groups.items():
+                if not len(atom_coordinates):
+                    continue
+                style = (
+                    {'marker': 'o', 'facecolors': 'none', 'edgecolors': category_colors[category]}
+                    if category == 'Both' else {'marker': 'x', 'color': category_colors[category]}
+                )
+                axis.scatter(
+                    atom_coordinates[:, 1], atom_coordinates[:, 0], s=args.marker_size,
+                    linewidths=args.agreement_marker_linewidth, alpha=0.96, **style,
+                )
+            _add_physical_scale_bar(
+                axis, display_view.shape, pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm), linewidth=float(args.scale_bar_linewidth),
+            )
+            counts = record['category_counts']
+            axis.text(
+                0.03, 0.035,
+                f"Both {counts['Both']} | H {counts['Hex-Net only']} | B {counts['Blob-Net only']}",
+                transform=axis.transAxes, color='white', fontsize=7.5, ha='left', va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.48, 'pad': 1.2},
+            )
+        for axis in flat_axes[panel_count:]:
+            axis.axis('off')
+        fig.legend(
+            handles=[Line2D([0], [0], linestyle='none', marker='o' if category == 'Both' else 'x',
+                            markerfacecolor='none', markeredgecolor=color,
+                            markeredgewidth=args.agreement_marker_linewidth, markersize=8, label=category)
+                     for category, color in category_colors.items()],
+            loc='upper center', bbox_to_anchor=(0.5, 1.10), ncol=3,
+            frameon=False, fontsize=AXIS_LABEL_SIZE,
+        )
+        sweep_label = 'hex-only-pixel-size-sweep' if args.fixed_blobnet_factor is not None else 'pixel-size-sweep'
+        output_path = output_dir / f'fig-Blob-Net-3-{image_label}-agreement-{sweep_label}.png'
+        fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+        plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'source_image': str(args.image),
+        'image_selection': 'Final displayed DCFI(HAADF) series frame.',
+        'velox_selection': velox_selection,
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm,
+        'base_pixel_size_nm': float(args.base_pixel_size_nm),
+        'blobnet_fixed_factor': (
+            None if args.fixed_blobnet_factor is None else float(args.fixed_blobnet_factor)
+        ),
+        'pixel_size_factors': [float(value) for value in factors],
+        'localization_threshold_rel': float(args.localization_threshold_rel),
+        'models': {
+            'Blob-Net': {
+                'checkpoint': str(args.blobnet_checkpoint),
+                'marker_color': args.blobnet_marker_color,
+                'records': model_records['Blob-Net'],
+            },
+            'Hexagonal model': {
+                'checkpoint': str(args.hexagonal_checkpoint),
+                'marker_color': args.hexagonal_marker_color,
+                'records': model_records['Hexagonal model'],
+            },
+        },
+    }
+    if args.combined_overlay:
+        summary['combined_overlay_style'] = {
+            'Blob-Net': {'marker': 'o', 'fill': 'none', 'color': args.blobnet_marker_color},
+            'Hexagonal model': {'marker': 'x', 'color': args.comparison_hexagonal_marker_color},
+        }
+    if args.agreement_overlay:
+        summary['agreement_radius_nm'] = float(args.agreement_radius_nm)
+        summary['agreement_records'] = agreement_records
+        summary['agreement_overlay_style'] = {
+            'Both': {'marker': 'o', 'fill': 'none', 'color': args.both_color},
+            'Hex-Net only': {'marker': 'x', 'color': args.hex_only_color},
+            'Blob-Net only': {'marker': 'x', 'color': args.blob_only_color},
+        }
+    output_path.with_suffix('.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3_ws2_hexnet_pixel_cutoff_grid(args: argparse.Namespace) -> Path:
+    """Plot Hex-Net detections across a physical-pixel-size by cutoff grid."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(
+        args.hexagonal_checkpoint, device, args.num_filters, args.dropout,
+    )
+    image = _load_experimental_image(args.image)
+    source_pixel_size_nm = _read_channel_pixel_size_nm(args.image)
+    processed = gaussian_filter(image, args.dog_small) - gaussian_filter(image, args.dog_large)
+    display_view = _center_crop_or_pad(_normalize_image(processed), args.experimental_crop_size)
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    factors = np.asarray(args.pixel_size_factors, dtype=np.float64)
+    cutoffs = np.asarray(args.cutoffs, dtype=np.float64)
+
+    predictions: list[np.ndarray] = []
+    scale_records: list[dict[str, Any]] = []
+    for factor in factors:
+        target_pixel_size_nm = float(args.base_pixel_size_nm) * float(factor)
+        native_pixels = max(1, int(round(field_of_view_nm / target_pixel_size_nm)))
+        native_view = _normalize_image(
+            _interpolate_image(display_view, (native_pixels, native_pixels))
+        )
+        predictions.append(_predict_tiled(
+            model, native_view, device, args.tile_size, args.tile_overlap, args.batch_size,
+        ))
+        scale_records.append({
+            'factor': float(factor),
+            'target_pixel_size_nm': target_pixel_size_nm,
+            'native_inference_pixels': native_pixels,
+        })
+
+    coordinate_grid: list[list[np.ndarray]] = []
+    records: list[dict[str, Any]] = []
+    for cutoff in cutoffs:
+        row_coordinates: list[np.ndarray] = []
+        for prediction, scale_record in zip(predictions, scale_records):
+            native_coordinates = np.asarray(extract_subpixel_peak_positions(
+                prediction, threshold_rel=float(cutoff), min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            ), dtype=np.float32).reshape(-1, 2)
+            display_coordinates = native_coordinates.copy()
+            if len(display_coordinates):
+                native_pixels = int(scale_record['native_inference_pixels'])
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_pixels - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_pixels - 1, 1)
+            row_coordinates.append(display_coordinates)
+            records.append({
+                **scale_record,
+                'cutoff': float(cutoff),
+                'predicted_atom_count': int(len(display_coordinates)),
+            })
+        coordinate_grid.append(row_coordinates)
+
+    rows = len(cutoffs)
+    columns = len(factors)
+    fig, axes = plt.subplots(
+        rows, columns, figsize=(2.7 * columns, 2.7 * rows), constrained_layout=True,
+        squeeze=False,
+    )
+    for row, cutoff in enumerate(cutoffs):
+        for column, (scale_record, atom_coordinates) in enumerate(zip(
+            scale_records, coordinate_grid[row],
+        )):
+            axis = axes[row, column]
+            title = ''
+            if row == 0:
+                title = (
+                    f"{scale_record['factor']:.2f}x | "
+                    f"{scale_record['target_pixel_size_nm']:.5f} nm/px\n"
+                    f"{scale_record['native_inference_pixels']} px"
+                )
+            _plot_clean_image(axis, display_view, title, cmap='gray')
+            if len(atom_coordinates):
+                axis.scatter(
+                    atom_coordinates[:, 1], atom_coordinates[:, 0],
+                    s=args.marker_size, marker='o', facecolors='none',
+                    edgecolors=args.hexnet_color, linewidths=args.marker_linewidth,
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axis, display_view.shape, pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+            axis.text(
+                0.03, 0.035, f'n={len(atom_coordinates)}', transform=axis.transAxes,
+                color='white', fontsize=7.5, ha='left', va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.48, 'pad': 1.2},
+            )
+            if column == 0:
+                axis.set_ylabel(f'Cutoff {cutoff:g}', fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'fig-Blob-Net-3-WS2-hexnet-pixel-cutoff-grid.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+    summary = {
+        'figure': str(output_path),
+        'source_image': str(args.image),
+        'model': 'Hex-Net',
+        'checkpoint': str(args.hexagonal_checkpoint),
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm,
+        'base_pixel_size_nm': float(args.base_pixel_size_nm),
+        'pixel_size_factors': [float(value) for value in factors],
+        'cutoffs': [float(value) for value in cutoffs],
+        'marker': {'shape': 'open circle', 'color': args.hexnet_color},
+        'records': records,
+        'processing': 'DoG background subtraction, 1st-99.8th percentile normalization, fixed FOV.',
+    }
+    output_path.with_suffix('.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_fov_sweep(args: argparse.Namespace) -> Path:
+    """Compare centered fields of view at one physical inference pixel size."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    models = [
+        (
+            'Blob-Net',
+            _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout),
+            args.blobnet_marker_color,
+        ),
+        (
+            'Hexagonal model',
+            _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout),
+            args.hexagonal_marker_color,
+        ),
+    ]
+
+    largest_crop = max(args.crop_sizes)
+    image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+        args.image,
+        largest_crop,
+    )
+    views: list[tuple[np.ndarray, np.ndarray, dict[str, Any]]] = []
+    for crop_size in args.crop_sizes:
+        field_of_view_nm = float(crop_size) * source_pixel_size_nm
+        native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+        display_view, native_view, transform = _make_fixed_fov_resolution_view(
+            image,
+            dog_small=args.dog_small,
+            dog_large=args.dog_large,
+            display_size=crop_size,
+            native_pixels=native_pixels,
+        )
+        transform.update(
+            {
+                'source_crop_pixels': int(crop_size),
+                'field_of_view_nm': field_of_view_nm,
+                'target_pixel_size_nm': float(args.target_pixel_size_nm),
+            }
+        )
+        views.append((display_view, native_view, transform))
+
+    coordinates: dict[str, list[np.ndarray]] = {}
+    model_records: dict[str, list[dict[str, Any]]] = {}
+    for model_label, model, _marker_color in models:
+        model_coordinates: list[np.ndarray] = []
+        records: list[dict[str, Any]] = []
+        for display_view, native_view, transform in views:
+            native_prediction = _predict_tiled(
+                model,
+                native_view,
+                device,
+                args.tile_size,
+                args.tile_overlap,
+                args.batch_size,
+            )
+            native_coordinates = extract_subpixel_peak_positions(
+                native_prediction,
+                threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            )
+            display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            model_coordinates.append(display_coordinates)
+            records.append(
+                {
+                    **transform,
+                    'predicted_atom_count': int(len(display_coordinates)),
+                    'prediction_mean': float(native_prediction.mean()),
+                    'prediction_max': float(native_prediction.max()),
+                }
+            )
+        coordinates[model_label] = model_coordinates
+        model_records[model_label] = records
+
+    fig, axes = plt.subplots(3, len(views), figsize=(4.0 * len(views), 11.2), constrained_layout=True)
+    for col, (display_view, _native_view, transform) in enumerate(views):
+        title = (
+            f"{transform['source_crop_pixels']} px crop\n"
+            f"{transform['field_of_view_nm']:.2f} nm FOV"
+        )
+        _plot_clean_image(axes[0, col], display_view, title, cmap='gray')
+        _add_physical_scale_bar(
+            axes[0, col],
+            display_view.shape,
+            pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        for row, (model_label, _model, marker_color) in enumerate(models, start=1):
+            _plot_clean_image(axes[row, col], display_view, '', cmap='gray')
+            atom_coordinates = coordinates[model_label][col]
+            marker_size = float(args.marker_size) * (float(args.crop_sizes[0]) / display_view.shape[0]) ** 2
+            if len(atom_coordinates):
+                axes[row, col].scatter(
+                    atom_coordinates[:, 1],
+                    atom_coordinates[:, 0],
+                    s=marker_size,
+                    facecolors=marker_color,
+                    edgecolors=args.marker_edge_color,
+                    linewidths=float(args.marker_linewidth) * float(args.crop_sizes[0]) / display_view.shape[0],
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axes[row, col],
+                display_view.shape,
+                pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+            axes[row, col].text(
+                0.04,
+                0.04,
+                f'n={len(atom_coordinates)}',
+                transform=axes[row, col].transAxes,
+                color='white',
+                fontsize=9,
+                ha='left',
+                va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+            )
+    axes[0, 0].set_ylabel('Input', fontsize=AXIS_LABEL_SIZE)
+    axes[1, 0].set_ylabel('Blob-Net', fontsize=AXIS_LABEL_SIZE)
+    axes[2, 0].set_ylabel('Hexagonal model', fontsize=AXIS_LABEL_SIZE)
+
+    image_label = args.image.name.split(' - ')[0]
+    output_path = output_dir / f'fig-Blob-Net-3c-{image_label}-fov-sweep.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'source_image': str(args.image),
+        'image_selection': 'Final displayed DCFI(HAADF) series frame, with HAADF fallback.',
+        'velox_selection': velox_selection,
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'source_shape': velox_selection['source_shape'],
+        'crop_sizes': [int(value) for value in args.crop_sizes],
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'localization_threshold_rel': float(args.localization_threshold_rel),
+        'models': {
+            model_label: {
+                'checkpoint': str(checkpoint),
+                'marker_color': marker_color,
+                'records': model_records[model_label],
+            }
+            for model_label, checkpoint, marker_color in [
+                ('Blob-Net', args.blobnet_checkpoint, args.blobnet_marker_color),
+                ('Hexagonal model', args.hexagonal_checkpoint, args.hexagonal_marker_color),
+            ]
+        },
+    }
+    (output_dir / f'fig-Blob-Net-3c-{image_label}-fov-sweep.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_region_atlas(args: argparse.Namespace) -> Path:
+    """Tile a full Velox frame into regional localization atlases for both models."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    models = [
+        (
+            'Blob-Net',
+            _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout),
+            args.blobnet_marker_color,
+            'blobnet',
+        ),
+        (
+            'Hexagonal model',
+            _load_blobnet_model(args.hexagonal_checkpoint, device, args.num_filters, args.dropout),
+            args.hexagonal_marker_color,
+            'hexagonal',
+        ),
+    ]
+
+    full_size = int(args.region_size * args.grid_size)
+    image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(args.image, full_size)
+    source_height, source_width = velox_selection['source_shape']
+    if full_size > min(source_height, source_width):
+        raise ValueError('Requested region grid exceeds the recorded image dimensions.')
+    source_y_offset = (source_height - full_size) // 2
+    source_x_offset = (source_width - full_size) // 2
+    field_of_view_nm = float(args.region_size) * source_pixel_size_nm
+    native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+    region_views: list[tuple[str, np.ndarray, np.ndarray, dict[str, Any]]] = []
+    region_index = 0
+    for row in range(args.grid_size):
+        for col in range(args.grid_size):
+            region_index += 1
+            y0 = row * args.region_size
+            x0 = col * args.region_size
+            region = image[y0 : y0 + args.region_size, x0 : x0 + args.region_size]
+            display_view, native_view, transform = _make_fixed_fov_resolution_view(
+                region,
+                dog_small=args.dog_small,
+                dog_large=args.dog_large,
+                display_size=args.region_size,
+                native_pixels=native_pixels,
+            )
+            transform.update(
+                {
+                    'region': f'R{region_index}',
+                    'grid_row': row + 1,
+                    'grid_column': col + 1,
+                    'source_bounds_pixels': [
+                        source_y_offset + y0,
+                        source_y_offset + y0 + args.region_size,
+                        source_x_offset + x0,
+                        source_x_offset + x0 + args.region_size,
+                    ],
+                    'field_of_view_nm': field_of_view_nm,
+                }
+            )
+            region_views.append((f'R{region_index}', display_view, native_view, transform))
+
+    model_records: dict[str, list[dict[str, Any]]] = {}
+    model_coordinates: dict[str, list[np.ndarray]] = {}
+    output_paths: dict[str, Path] = {}
+    image_label = args.image.name.split(' - ')[0]
+    for model_label, model, marker_color, file_label in models:
+        records: list[dict[str, Any]] = []
+        coordinates: list[np.ndarray] = []
+        for region_label, display_view, native_view, transform in region_views:
+            native_prediction = _predict_tiled(
+                model,
+                native_view,
+                device,
+                args.tile_size,
+                args.tile_overlap,
+                args.batch_size,
+            )
+            native_coordinates = extract_subpixel_peak_positions(
+                native_prediction,
+                threshold_rel=args.localization_threshold_rel,
+                min_distance=args.peak_min_distance,
+                window_size=args.peak_window_size,
+            )
+            display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+            if len(display_coordinates):
+                display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+                display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            coordinates.append(display_coordinates)
+            records.append(
+                {
+                    **transform,
+                    'predicted_atom_count': int(len(display_coordinates)),
+                    'prediction_mean': float(native_prediction.mean()),
+                    'prediction_max': float(native_prediction.max()),
+                }
+            )
+
+        fig, axes = plt.subplots(
+            args.grid_size,
+            args.grid_size,
+            figsize=(3.2 * args.grid_size, 3.2 * args.grid_size),
+            constrained_layout=True,
+        )
+        for axis, (region_label, display_view, _native_view, _transform), atom_coordinates in zip(
+            np.asarray(axes).reshape(-1),
+            region_views,
+            coordinates,
+        ):
+            _plot_clean_image(axis, display_view, region_label, cmap='gray')
+            if len(atom_coordinates):
+                axis.scatter(
+                    atom_coordinates[:, 1],
+                    atom_coordinates[:, 0],
+                    s=args.marker_size,
+                    facecolors=marker_color,
+                    edgecolors=args.marker_edge_color,
+                    linewidths=args.marker_linewidth,
+                    alpha=0.96,
+                )
+            _add_physical_scale_bar(
+                axis,
+                display_view.shape,
+                pixel_size_nm=source_pixel_size_nm,
+                length_nm=float(args.scale_bar_length_nm),
+                linewidth=float(args.scale_bar_linewidth),
+            )
+            axis.text(
+                0.04,
+                0.04,
+                f'n={len(atom_coordinates)}',
+                transform=axis.transAxes,
+                color='white',
+                fontsize=9,
+                ha='left',
+                va='bottom',
+                bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+            )
+        fig.suptitle(model_label, fontsize=AXIS_LABEL_SIZE + 2)
+        output_path = output_dir / f'fig-Blob-Net-3c-{image_label}-512-region-atlas-{file_label}.png'
+        fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+        plt.close(fig)
+        output_paths[model_label] = output_path
+        model_records[model_label] = records
+        model_coordinates[model_label] = coordinates
+
+    fig, axes = plt.subplots(
+        args.grid_size,
+        args.grid_size,
+        figsize=(max(6.4, 3.2 * args.grid_size), max(6.4, 3.2 * args.grid_size)),
+        constrained_layout=True,
+    )
+    for region_number, (axis, (_region_label, display_view, _native_view, _transform)) in enumerate(
+        zip(np.asarray(axes).reshape(-1), region_views),
+        start=1,
+    ):
+        region_title = f'{image_label}: center' if args.grid_size == 1 else f'R{region_number}'
+        _plot_clean_image(axis, display_view, region_title, cmap='gray')
+        blob_coordinates = model_coordinates['Blob-Net'][region_number - 1]
+        hex_coordinates = model_coordinates['Hexagonal model'][region_number - 1]
+        if len(blob_coordinates):
+            axis.scatter(
+                blob_coordinates[:, 1],
+                blob_coordinates[:, 0],
+                s=args.marker_size,
+                marker='o',
+                facecolors='none',
+                edgecolors=args.blobnet_marker_color,
+                linewidths=1.05,
+                alpha=1.0,
+                zorder=3,
+            )
+        if len(hex_coordinates):
+            axis.scatter(
+                hex_coordinates[:, 1],
+                hex_coordinates[:, 0],
+                s=float(args.marker_size) * 0.72,
+                marker='x',
+                color=args.comparison_hexagonal_marker_color,
+                linewidths=1.05,
+                alpha=1.0,
+                zorder=4,
+            )
+        _add_physical_scale_bar(
+            axis,
+            display_view.shape,
+            pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        axis.text(
+            0.04,
+            0.04,
+            f'B={len(blob_coordinates)}  H={len(hex_coordinates)}',
+            transform=axis.transAxes,
+            color='white',
+            fontsize=8,
+            ha='left',
+            va='bottom',
+            bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+        )
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker='o',
+            color='none',
+            markerfacecolor='none',
+            markeredgecolor=args.blobnet_marker_color,
+            markeredgewidth=1.05,
+            markersize=8,
+            label='Blob-Net',
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker='x',
+            color=args.comparison_hexagonal_marker_color,
+            markeredgewidth=1.4,
+            markersize=8,
+            label='Hexagonal model',
+        ),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.08 if args.grid_size == 1 else 1.035),
+        ncol=2,
+        frameon=False,
+        fontsize=AXIS_LABEL_SIZE,
+    )
+    combined_path = output_dir / f'fig-Blob-Net-3c-{image_label}-512-region-atlas-combined.png'
+    fig.savefig(combined_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+    output_paths['Combined comparison'] = combined_path
+
+    summary = {
+        'figures': {label: str(path) for label, path in output_paths.items()},
+        'combined_overlay_style': {
+            'Blob-Net': {'marker': 'o', 'color': args.blobnet_marker_color, 'fill': 'none', 'linewidth': 1.05},
+            'Hexagonal model': {'marker': 'x', 'color': args.comparison_hexagonal_marker_color},
+        },
+        'source_image': str(args.image),
+        'image_selection': 'Full displayed DCFI(HAADF) series frame, with HAADF fallback.',
+        'velox_selection': velox_selection,
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'full_frame_pixels': full_size,
+        'recorded_source_shape': velox_selection['source_shape'],
+        'grid_origin_source_pixels': [source_y_offset, source_x_offset],
+        'grid_size': int(args.grid_size),
+        'region_size_pixels': int(args.region_size),
+        'region_field_of_view_nm': field_of_view_nm,
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'native_inference_pixels_per_region': native_pixels,
+        'localization_threshold_rel': float(args.localization_threshold_rel),
+        'models': {
+            'Blob-Net': {
+                'checkpoint': str(args.blobnet_checkpoint),
+                'marker_color': args.blobnet_marker_color,
+                'records': model_records['Blob-Net'],
+            },
+            'Hexagonal model': {
+                'checkpoint': str(args.hexagonal_checkpoint),
+                'marker_color': args.hexagonal_marker_color,
+                'records': model_records['Hexagonal model'],
+            },
+        },
+    }
+    metadata_path = output_dir / f'fig-Blob-Net-3c-{image_label}-512-region-atlas.json'
+    metadata_path.write_text(json.dumps(summary, indent=2))
+    return output_paths['Combined comparison']
+
+
+def make_figure_3c_sqrt_input(args: argparse.Namespace) -> Path:
+    """Compare standard and square-root-transformed inputs for Blob-Net on one image."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout)
+
+    image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+        args.image,
+        args.experimental_crop_size,
+    )
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+    display_view, native_view, transform = _make_fixed_fov_resolution_view(
+        image,
+        dog_small=args.dog_small,
+        dog_large=args.dog_large,
+        display_size=args.experimental_crop_size,
+        native_pixels=native_pixels,
+    )
+    variants = [
+        ('Standard input', display_view, native_view, 1.0),
+        ('Square-root input', np.sqrt(np.clip(display_view, 0.0, 1.0)), np.sqrt(np.clip(native_view, 0.0, 1.0)), 0.5),
+    ]
+
+    coordinates: list[np.ndarray] = []
+    records: list[dict[str, Any]] = []
+    for label, _display_input, inference_input, power in variants:
+        native_prediction = _predict_tiled(
+            model,
+            inference_input,
+            device,
+            args.tile_size,
+            args.tile_overlap,
+            args.batch_size,
+        )
+        native_coordinates = extract_subpixel_peak_positions(
+            native_prediction,
+            threshold_rel=args.localization_threshold_rel,
+            min_distance=args.peak_min_distance,
+            window_size=args.peak_window_size,
+        )
+        display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+        if len(display_coordinates):
+            display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(inference_input.shape[0] - 1, 1)
+            display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(inference_input.shape[1] - 1, 1)
+        coordinates.append(display_coordinates)
+        records.append(
+            {
+                'label': label,
+                'input_power': power,
+                'predicted_atom_count': int(len(display_coordinates)),
+                'prediction_mean': float(native_prediction.mean()),
+                'prediction_max': float(native_prediction.max()),
+            }
+        )
+
+    fig, axes = plt.subplots(2, 2, figsize=(7.6, 7.6), constrained_layout=True)
+    for col, (label, display_input, _inference_input, _power) in enumerate(variants):
+        _plot_clean_image(axes[0, col], display_input, label, cmap='gray')
+        _add_physical_scale_bar(
+            axes[0, col],
+            display_input.shape,
+            pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        _plot_clean_image(axes[1, col], display_view, '', cmap='gray')
+        atom_coordinates = coordinates[col]
+        if len(atom_coordinates):
+            axes[1, col].scatter(
+                atom_coordinates[:, 1],
+                atom_coordinates[:, 0],
+                s=args.marker_size,
+                facecolors=args.blobnet_marker_color,
+                edgecolors=args.marker_edge_color,
+                linewidths=args.marker_linewidth,
+                alpha=0.96,
+            )
+        _add_physical_scale_bar(
+            axes[1, col],
+            display_view.shape,
+            pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        axes[1, col].text(
+            0.04,
+            0.04,
+            f'n={len(atom_coordinates)}',
+            transform=axes[1, col].transAxes,
+            color='white',
+            fontsize=9,
+            ha='left',
+            va='bottom',
+            bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+        )
+    axes[0, 0].set_ylabel('Model input', fontsize=AXIS_LABEL_SIZE)
+    axes[1, 0].set_ylabel('Blob-Net detections', fontsize=AXIS_LABEL_SIZE)
+
+    output_path = output_dir / 'fig-Blob-Net-3c-0063-sqrt-input.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'source_image': str(args.image),
+        'image_selection': 'Final displayed DCFI(HAADF) series frame.',
+        'velox_selection': velox_selection,
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm,
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'native_inference_pixels': native_pixels,
+        'localization_threshold_rel': float(args.localization_threshold_rel),
+        'checkpoint': str(args.blobnet_checkpoint),
+        'records': records,
+        'processing': {
+            **transform,
+            'sqrt_stage': 'After DoG processing and [0, 1] normalization; immediately before inference.',
+        },
+    }
+    (output_dir / 'fig-Blob-Net-3c-0063-sqrt-input.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure_3c_blobnet_cutoff_gallery(args: argparse.Namespace) -> Path:
+    """Show a compact low-cutoff gallery for Blob-Net on one Velox HAADF image."""
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(args.blobnet_checkpoint, device, args.num_filters, args.dropout)
+
+    image, source_pixel_size_nm, velox_selection = _load_velox_displayed_haadf(
+        args.image,
+        args.experimental_crop_size,
+    )
+    field_of_view_nm = float(args.experimental_crop_size) * source_pixel_size_nm
+    native_pixels = max(1, int(round(field_of_view_nm / args.target_pixel_size_nm)))
+    display_view, native_view, transform = _make_fixed_fov_resolution_view(
+        image,
+        dog_small=args.dog_small,
+        dog_large=args.dog_large,
+        display_size=args.experimental_crop_size,
+        native_pixels=native_pixels,
+    )
+    native_prediction = _predict_tiled(
+        model,
+        native_view,
+        device,
+        args.tile_size,
+        args.tile_overlap,
+        args.batch_size,
+    )
+    cutoffs = np.linspace(args.cutoff_min, args.cutoff_max, args.steps, dtype=np.float64)
+
+    coordinates: list[np.ndarray] = []
+    records: list[dict[str, Any]] = []
+    for cutoff in cutoffs:
+        native_coordinates = extract_subpixel_peak_positions(
+            native_prediction,
+            threshold_rel=float(cutoff),
+            min_distance=args.peak_min_distance,
+            window_size=args.peak_window_size,
+        )
+        display_coordinates = np.asarray(native_coordinates, dtype=np.float32).copy()
+        if len(display_coordinates):
+            display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
+            display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+        coordinates.append(display_coordinates)
+        records.append(
+            {
+                'cutoff': float(cutoff),
+                'predicted_atom_count': int(len(display_coordinates)),
+            }
+        )
+
+    panel_count = len(cutoffs) + 1
+    columns = 4
+    rows = int(math.ceil(panel_count / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(3.2 * columns, 3.2 * rows), constrained_layout=True)
+    flat_axes = np.asarray(axes).reshape(-1)
+    _plot_clean_image(flat_axes[0], display_view, 'Input', cmap='gray')
+    _add_physical_scale_bar(
+        flat_axes[0],
+        display_view.shape,
+        pixel_size_nm=source_pixel_size_nm,
+        length_nm=float(args.scale_bar_length_nm),
+        linewidth=float(args.scale_bar_linewidth),
+    )
+
+    for axis, cutoff, atom_coordinates in zip(flat_axes[1:], cutoffs, coordinates):
+        _plot_clean_image(axis, display_view, f'Cutoff {cutoff:.2f}', cmap='gray')
+        if len(atom_coordinates):
+            axis.scatter(
+                atom_coordinates[:, 1],
+                atom_coordinates[:, 0],
+                s=args.marker_size,
+                facecolors=args.blobnet_marker_color,
+                edgecolors=args.marker_edge_color,
+                linewidths=args.marker_linewidth,
+                alpha=0.96,
+            )
+        _add_physical_scale_bar(
+            axis,
+            display_view.shape,
+            pixel_size_nm=source_pixel_size_nm,
+            length_nm=float(args.scale_bar_length_nm),
+            linewidth=float(args.scale_bar_linewidth),
+        )
+        axis.text(
+            0.04,
+            0.04,
+            f'n={len(atom_coordinates)}',
+            transform=axis.transAxes,
+            color='white',
+            fontsize=9,
+            ha='left',
+            va='bottom',
+            bbox={'facecolor': 'black', 'edgecolor': 'none', 'alpha': 0.45, 'pad': 1.2},
+        )
+    for axis in flat_axes[panel_count:]:
+        axis.axis('off')
+
+    output_path = output_dir / 'fig-Blob-Net-3c-0063-low-cutoff-gallery.png'
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+
+    summary = {
+        'figure': str(output_path),
+        'source_image': str(args.image),
+        'image_selection': 'Final displayed DCFI(HAADF) series frame.',
+        'velox_selection': velox_selection,
+        'source_pixel_size_nm': source_pixel_size_nm,
+        'field_of_view_nm': field_of_view_nm,
+        'target_pixel_size_nm': float(args.target_pixel_size_nm),
+        'native_inference_pixels': native_pixels,
+        'cutoff_range': [float(args.cutoff_min), float(args.cutoff_max)],
+        'steps': int(args.steps),
+        'checkpoint': str(args.blobnet_checkpoint),
+        'records': records,
+        'processing': transform,
+    }
+    (output_dir / 'fig-Blob-Net-3c-0063-low-cutoff-gallery.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_quasicrystal_scale_sweep(args: argparse.Namespace) -> Path:
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
+
+    source_image = _load_experimental_image(args.image)
+    processed_image = gaussian_filter(source_image, args.dog_small) - gaussian_filter(source_image, args.dog_large)
+    processed_image = _normalize_image(processed_image)
+    fixed_fov = _center_crop_or_pad(processed_image, args.crop_size)
+    scales = np.linspace(args.scale_min, args.scale_max, args.steps, dtype=np.float64)
+
+    records: list[dict[str, Any]] = []
+    native_views: list[np.ndarray] = []
+    native_predictions: list[np.ndarray] = []
+    display_predictions: list[np.ndarray] = []
+    for scale in scales:
+        n_pixels = max(1, int(round(args.crop_size * float(scale))))
+        native_view = _normalize_image(_interpolate_image(fixed_fov, (n_pixels, n_pixels)))
+        native_prediction = _predict_tiled(
+            model,
+            native_view,
+            device,
+            args.tile_size,
+            args.tile_overlap,
+            args.batch_size,
+        )
+        display_prediction = _interpolate_image(native_prediction, fixed_fov.shape)
+        coordinates = extract_subpixel_peak_positions(
+            display_prediction,
+            threshold_rel=args.threshold_rel,
+            min_distance=args.peak_min_distance,
+            window_size=args.peak_window_size,
+        )
+        native_views.append(native_view)
+        native_predictions.append(native_prediction)
+        display_predictions.append(display_prediction)
+        records.append(
+            {
+                'scale': float(scale),
+                'native_height': int(native_view.shape[0]),
+                'native_width': int(native_view.shape[1]),
+                'display_height': int(display_prediction.shape[0]),
+                'display_width': int(display_prediction.shape[1]),
+                'predicted_peak_count': int(len(coordinates)),
+                'prediction_mean': float(native_prediction.mean()),
+                'prediction_max': float(native_prediction.max()),
+            }
+        )
+
+    columns = 5
+    rows = int(np.ceil(len(scales) / columns))
+    global_prediction_max = max(float(prediction.max()) for prediction in display_predictions)
+
+    overlay_figure, overlay_axes = plt.subplots(rows, columns, figsize=(15, 3.05 * rows), constrained_layout=True)
+    heatmap_figure, heatmap_axes = plt.subplots(rows, columns, figsize=(15, 3.05 * rows), constrained_layout=True)
+    overlay_axes = np.asarray(overlay_axes).reshape(-1)
+    heatmap_axes = np.asarray(heatmap_axes).reshape(-1)
+    for index, (record, prediction) in enumerate(zip(records, display_predictions)):
+        title = f"{record['scale']:.3f}x | {record['native_width']} x {record['native_height']} px"
+        overlay_axes[index].imshow(fixed_fov, cmap='gray', vmin=0.0, vmax=1.0)
+        overlay_alpha = np.clip(prediction / max(global_prediction_max, 1e-8), 0.0, 1.0) * 0.90
+        overlay_axes[index].imshow(
+            prediction,
+            cmap=MODEL_CMAPS['random'],
+            vmin=0.0,
+            vmax=global_prediction_max,
+            alpha=overlay_alpha,
+        )
+        overlay_axes[index].set_title(title, fontsize=10)
+        overlay_axes[index].set_xticks([])
+        overlay_axes[index].set_yticks([])
+
+        heatmap_axes[index].imshow(
+            prediction,
+            cmap=MODEL_CMAPS['random'],
+            vmin=0.0,
+            vmax=global_prediction_max,
+        )
+        heatmap_axes[index].set_title(title, fontsize=10)
+        heatmap_axes[index].set_xticks([])
+        heatmap_axes[index].set_yticks([])
+
+    for axis in overlay_axes[len(scales) :]:
+        axis.set_visible(False)
+    for axis in heatmap_axes[len(scales) :]:
+        axis.set_visible(False)
+
+    overlay_path = output_dir / 'quasicrystal_scale_sweep_overlay.png'
+    heatmap_path = output_dir / 'quasicrystal_scale_sweep_heatmaps.png'
+    overlay_figure.savefig(overlay_path, dpi=args.dpi, bbox_inches='tight')
+    heatmap_figure.savefig(heatmap_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(overlay_figure)
+    plt.close(heatmap_figure)
+
+    array_payload: dict[str, np.ndarray] = {
+        'scales': scales.astype(np.float32),
+        'fixed_fov': fixed_fov.astype(np.float32),
+        'display_predictions': np.stack(display_predictions).astype(np.float32),
+    }
+    for index, (native_view, native_prediction) in enumerate(zip(native_views, native_predictions)):
+        array_payload[f'model_input_{index:02d}'] = native_view.astype(np.float32)
+        array_payload[f'native_prediction_{index:02d}'] = native_prediction.astype(np.float32)
+    np.savez_compressed(output_dir / 'quasicrystal_scale_sweep_predictions.npz', **array_payload)
+    summary = {
+        'source_image': str(args.image),
+        'checkpoint': str(args.checkpoint),
+        'interpolation': 'scipy.interpolate.RegularGridInterpolator(method=linear)',
+        'preprocessing': 'DoG background subtraction, percentile normalization, fixed center FOV, interpolation',
+        'field_of_view': 'Constant across all scales; only the native inference pixel grid changes.',
+        'dog_small': float(args.dog_small),
+        'dog_large': float(args.dog_large),
+        'crop_size': int(args.crop_size),
+        'threshold_rel': float(args.threshold_rel),
+        'overlay_path': str(overlay_path),
+        'heatmap_path': str(heatmap_path),
+        'records': records,
+    }
+    (output_dir / 'quasicrystal_scale_sweep.json').write_text(json.dumps(summary, indent=2))
+    return overlay_path
+
+
+def make_quasicrystal_common_pixel_size(args: argparse.Namespace) -> Path:
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
+
+    pixel_sizes_nm = [_read_channel_pixel_size_nm(path) for path in args.images]
+    target_pixel_size_nm = (
+        float(args.target_pixel_size_nm)
+        if args.target_pixel_size_nm is not None
+        else max(pixel_sizes_nm)
+    )
+
+    records: list[dict[str, Any]] = []
+    display_views: list[np.ndarray] = []
+    display_predictions: list[np.ndarray] = []
+    native_views: list[np.ndarray] = []
+    native_predictions: list[np.ndarray] = []
+    for path, source_pixel_size_nm in zip(args.images, pixel_sizes_nm):
+        source_image = _load_experimental_image(path)
+        processed_image = gaussian_filter(source_image, args.dog_small) - gaussian_filter(source_image, args.dog_large)
+        processed_image = _normalize_image(processed_image)
+        display_view = _center_crop_or_pad(processed_image, args.crop_size)
+        field_of_view_nm = float(args.crop_size) * source_pixel_size_nm
+        native_pixels = max(1, int(round(field_of_view_nm / target_pixel_size_nm)))
+        native_view = _normalize_image(_interpolate_image(display_view, (native_pixels, native_pixels)))
+        native_prediction = _predict_tiled(
+            model,
+            native_view,
+            device,
+            args.tile_size,
+            args.tile_overlap,
+            args.batch_size,
+        )
+        display_prediction = _interpolate_image(native_prediction, display_view.shape)
+
+        display_views.append(display_view)
+        display_predictions.append(display_prediction)
+        native_views.append(native_view)
+        native_predictions.append(native_prediction)
+        records.append(
+            {
+                'source_image': str(path),
+                'source_pixel_size_nm': source_pixel_size_nm,
+                'target_pixel_size_nm': target_pixel_size_nm,
+                'field_of_view_nm': field_of_view_nm,
+                'display_pixels': int(args.crop_size),
+                'native_inference_pixels': native_pixels,
+                'resolution_scale': float(native_pixels) / float(args.crop_size),
+                'prediction_mean': float(native_prediction.mean()),
+                'prediction_max': float(native_prediction.max()),
+            }
+        )
+
+    figure, axes = plt.subplots(2, len(records), figsize=(4.2 * len(records), 7.2), constrained_layout=True)
+    for column, (record, display_view, display_prediction) in enumerate(
+        zip(records, display_views, display_predictions)
+    ):
+        axes[0, column].imshow(display_view, cmap='gray', vmin=0.0, vmax=1.0)
+        axes[0, column].set_title(
+            f"{Path(record['source_image']).name.split(' - ')[0]}\n"
+            f"{record['source_pixel_size_nm']:.6f} nm/px native",
+            fontsize=11,
+        )
+        axes[0, column].set_xticks([])
+        axes[0, column].set_yticks([])
+        axes[1, column].imshow(
+            display_prediction,
+            cmap=MODEL_CMAPS['random'],
+            vmin=0.0,
+            vmax=max(float(display_prediction.max()), 1e-6),
+        )
+        axes[1, column].set_title(
+            f"{record['native_inference_pixels']} x {record['native_inference_pixels']} px inference\n"
+            f"{target_pixel_size_nm:.6f} nm/px common",
+            fontsize=11,
+        )
+        axes[1, column].set_xticks([])
+        axes[1, column].set_yticks([])
+
+    output_path = output_dir / 'quasicrystal_common_pixel_size.png'
+    figure.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(figure)
+
+    array_payload: dict[str, np.ndarray] = {
+        'source_pixel_sizes_nm': np.asarray(pixel_sizes_nm, dtype=np.float64),
+        'target_pixel_size_nm': np.asarray(target_pixel_size_nm, dtype=np.float64),
+        'display_inputs': np.stack(display_views).astype(np.float32),
+        'display_predictions': np.stack(display_predictions).astype(np.float32),
+    }
+    for index, (native_view, native_prediction) in enumerate(zip(native_views, native_predictions)):
+        array_payload[f'model_input_{index:02d}'] = native_view.astype(np.float32)
+        array_payload[f'native_prediction_{index:02d}'] = native_prediction.astype(np.float32)
+    np.savez_compressed(output_dir / 'quasicrystal_common_pixel_size.npz', **array_payload)
+
+    summary = {
+        'figure': str(output_path),
+        'pixel_size_source': "pyTEMlib Channel_000 original_metadata['BinaryResult']['PixelSize']",
+        'target_selection': 'Largest native pixel size, avoiding interpolation-based upsampling.',
+        'field_of_view': 'Preserved independently for each 512 x 512 source crop.',
+        'records': records,
+    }
+    (output_dir / 'quasicrystal_common_pixel_size.json').write_text(json.dumps(summary, indent=2))
+    return output_path
+
+
+def make_figure3_pixel_size_sweep(args: argparse.Namespace) -> Path:
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _device_from_name(args.device)
+    model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
+
+    source_pixel_sizes_nm = [_read_channel_pixel_size_nm(path) for path in args.images]
+    display_views: list[np.ndarray] = []
+    field_of_views_nm: list[float] = []
+    for path, source_pixel_size_nm in zip(args.images, source_pixel_sizes_nm):
+        source_image = _load_experimental_image(path)
+        processed_image = gaussian_filter(source_image, args.dog_small) - gaussian_filter(source_image, args.dog_large)
+        processed_image = _normalize_image(processed_image)
+        display_views.append(_center_crop_or_pad(processed_image, args.crop_size))
+        field_of_views_nm.append(float(args.crop_size) * source_pixel_size_nm)
+
+    factors = np.linspace(args.factor_min, args.factor_max, args.steps, dtype=np.float64)
+    sweep_predictions: list[list[np.ndarray]] = []
+    native_inputs: list[list[np.ndarray]] = []
+    native_predictions: list[list[np.ndarray]] = []
+    records: list[dict[str, Any]] = []
+    for factor in factors:
+        target_pixel_size_nm = float(args.base_pixel_size_nm) * float(factor)
+        factor_display_predictions: list[np.ndarray] = []
+        factor_native_inputs: list[np.ndarray] = []
+        factor_native_predictions: list[np.ndarray] = []
+        native_pixel_counts: list[int] = []
+        for display_view, field_of_view_nm in zip(display_views, field_of_views_nm):
+            native_pixels = max(1, int(round(field_of_view_nm / target_pixel_size_nm)))
+            native_view = _normalize_image(_interpolate_image(display_view, (native_pixels, native_pixels)))
+            native_prediction = _predict_tiled(
+                model,
+                native_view,
+                device,
+                args.tile_size,
+                args.tile_overlap,
+                args.batch_size,
+            )
+            display_prediction = _interpolate_image(native_prediction, display_view.shape)
+            factor_native_inputs.append(native_view)
+            factor_native_predictions.append(native_prediction)
+            factor_display_predictions.append(display_prediction)
+            native_pixel_counts.append(native_pixels)
+
+        native_inputs.append(factor_native_inputs)
+        native_predictions.append(factor_native_predictions)
+        sweep_predictions.append(factor_display_predictions)
+        records.append(
+            {
+                'factor': float(factor),
+                'target_pixel_size_nm': target_pixel_size_nm,
+                'native_inference_pixels': native_pixel_counts,
+            }
+        )
+
+    rows = int(np.ceil(args.steps / 5))
+    columns = min(5, args.steps)
+    overlay_figure, overlay_axes = plt.subplots(rows, columns, figsize=(15, 2.35 * rows), constrained_layout=True)
+    heatmap_figure, heatmap_axes = plt.subplots(rows, columns, figsize=(15, 2.35 * rows), constrained_layout=True)
+    overlay_axes = np.asarray(overlay_axes).reshape(-1)
+    heatmap_axes = np.asarray(heatmap_axes).reshape(-1)
+    combined_inputs = np.concatenate(display_views, axis=1)
+    global_prediction_max = max(
+        float(prediction.max())
+        for factor_predictions in sweep_predictions
+        for prediction in factor_predictions
+    )
+
+    for index, (record, factor_predictions) in enumerate(zip(records, sweep_predictions)):
+        combined_prediction = np.concatenate(factor_predictions, axis=1)
+        counts = '/'.join(str(value) for value in record['native_inference_pixels'])
+        title = (
+            f"{record['factor']:.3f}x | {record['target_pixel_size_nm']:.5f} nm/px\n"
+            f'W/Q/T: {counts} px'
+        )
+        overlay_axes[index].imshow(combined_inputs, cmap='gray', vmin=0.0, vmax=1.0)
+        overlay_alpha = np.clip(combined_prediction / max(global_prediction_max, 1e-8), 0.0, 1.0) * 0.90
+        overlay_axes[index].imshow(
+            combined_prediction,
+            cmap=MODEL_CMAPS['random'],
+            vmin=0.0,
+            vmax=global_prediction_max,
+            alpha=overlay_alpha,
+        )
+        heatmap_axes[index].imshow(
+            combined_prediction,
+            cmap=MODEL_CMAPS['random'],
+            vmin=0.0,
+            vmax=global_prediction_max,
+        )
+        for axis in (overlay_axes[index], heatmap_axes[index]):
+            axis.set_title(title, fontsize=8)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            axis.axvline(args.crop_size - 0.5, color='#777777', linewidth=0.5)
+            axis.axvline(2 * args.crop_size - 0.5, color='#777777', linewidth=0.5)
+            for panel_index, label in enumerate(('W', 'Q', 'T')):
+                axis.text(
+                    (panel_index + 0.03) / 3.0,
+                    0.95,
+                    label,
+                    transform=axis.transAxes,
+                    ha='left',
+                    va='top',
+                    fontsize=7,
+                    color='black',
+                    bbox={'facecolor': 'white', 'edgecolor': 'none', 'alpha': 0.7, 'pad': 0.8},
+                )
+
+    for axis in overlay_axes[len(records) :]:
+        axis.set_visible(False)
+    for axis in heatmap_axes[len(records) :]:
+        axis.set_visible(False)
+
+    overlay_path = output_dir / 'figure3_pixel_size_sweep_overlay.png'
+    heatmap_path = output_dir / 'figure3_pixel_size_sweep_heatmaps.png'
+    overlay_figure.savefig(overlay_path, dpi=args.dpi, bbox_inches='tight')
+    heatmap_figure.savefig(heatmap_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(overlay_figure)
+    plt.close(heatmap_figure)
+
+    array_payload: dict[str, np.ndarray] = {
+        'factors': factors.astype(np.float32),
+        'source_pixel_sizes_nm': np.asarray(source_pixel_sizes_nm, dtype=np.float64),
+        'base_pixel_size_nm': np.asarray(args.base_pixel_size_nm, dtype=np.float64),
+        'display_inputs': np.stack(display_views).astype(np.float32),
+        'display_predictions': np.asarray(sweep_predictions, dtype=np.float32),
+    }
+    for factor_index, (factor_inputs, factor_predictions) in enumerate(zip(native_inputs, native_predictions)):
+        for image_index, (native_input, native_prediction) in enumerate(zip(factor_inputs, factor_predictions)):
+            array_payload[f'model_input_{factor_index:02d}_{image_index:02d}'] = native_input.astype(np.float32)
+            array_payload[f'native_prediction_{factor_index:02d}_{image_index:02d}'] = native_prediction.astype(np.float32)
+    np.savez_compressed(output_dir / 'figure3_pixel_size_sweep.npz', **array_payload)
+
+    summary = {
+        'images': [str(path) for path in args.images],
+        'image_order': ['WS2', 'Quasicrystal', 'Twin boundary'],
+        'source_pixel_sizes_nm': source_pixel_sizes_nm,
+        'field_of_views_nm': field_of_views_nm,
+        'base_pixel_size_nm': float(args.base_pixel_size_nm),
+        'factor_range': [float(args.factor_min), float(args.factor_max)],
+        'steps': int(args.steps),
+        'field_of_view': 'Preserved independently for every image throughout the sweep.',
+        'records': records,
+    }
+    (output_dir / 'figure3_pixel_size_sweep.json').write_text(json.dumps(summary, indent=2))
+    return overlay_path
 
 
 def _experimental_figure_files(args: argparse.Namespace) -> list[tuple[str, Path]]:
@@ -664,7 +3332,7 @@ def _plot_experimental_localization_overlay(
         ax.legend(handles=handles, loc='upper right', fontsize=9, frameon=True, borderpad=0.25, labelspacing=0.25)
 
 
-def make_figure_2_localizations(args: argparse.Namespace) -> Path:
+def make_figure_3_localizations(args: argparse.Namespace) -> Path:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
@@ -729,7 +3397,7 @@ def make_figure_2_localizations(args: argparse.Namespace) -> Path:
 
     fig, axes = plt.subplots(4, len(panels), figsize=(16, 14.5), constrained_layout=True)
     row_labels = [
-        'Figure 2 input',
+        'Figure 3 input',
         'Clean localizations',
         f'Poisson localizations ({args.poisson_counts:g} counts)',
         f'Poisson localizations ({args.heavy_poisson_counts:g} counts)',
@@ -752,7 +3420,7 @@ def make_figure_2_localizations(args: argparse.Namespace) -> Path:
             if col == 0:
                 axes[row, col].set_ylabel(row_labels[row], fontsize=AXIS_LABEL_SIZE)
 
-    output_path = output_dir / 'figure2_experimental_localization_comparison.png'
+    output_path = output_dir / 'figure3_experimental_localization_comparison.png'
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
 
@@ -777,7 +3445,7 @@ def make_figure_2_localizations(args: argparse.Namespace) -> Path:
                 'prediction_max': float(prediction.max()),
             }
         summary.append(panel_summary)
-    (output_dir / 'figure2_experimental_localization_comparison.json').write_text(json.dumps(summary, indent=2))
+    (output_dir / 'figure3_experimental_localization_comparison.json').write_text(json.dumps(summary, indent=2))
     return output_path
 
 
@@ -949,16 +3617,16 @@ def _edge_figure_render_config(
 ) -> ImageFormationConfig:
     sigma_min, sigma_max = float(sigma_range[0]), float(sigma_range[1])
     if quiet_background:
-        background_range = FIGURE5_FIXED_NOISE_PARAMETERS['background_range']
-        gradient_range = FIGURE5_FIXED_NOISE_PARAMETERS['gradient_range']
-        inhomogeneous_background_range = FIGURE5_FIXED_NOISE_PARAMETERS['inhomogeneous_background_range']
-        inhomogeneous_background_sigma_fraction_range = FIGURE5_FIXED_NOISE_PARAMETERS[
+        background_range = FIGURE2_FIXED_NOISE_PARAMETERS['background_range']
+        gradient_range = FIGURE2_FIXED_NOISE_PARAMETERS['gradient_range']
+        inhomogeneous_background_range = FIGURE2_FIXED_NOISE_PARAMETERS['inhomogeneous_background_range']
+        inhomogeneous_background_sigma_fraction_range = FIGURE2_FIXED_NOISE_PARAMETERS[
             'inhomogeneous_background_sigma_fraction_range'
         ]
-        low_frequency_noise_range = FIGURE5_FIXED_NOISE_PARAMETERS['low_frequency_noise_range']
-        low_frequency_sigma_fraction_range = FIGURE5_FIXED_NOISE_PARAMETERS['low_frequency_sigma_fraction_range']
-        read_noise_std_range = FIGURE5_FIXED_NOISE_PARAMETERS['read_noise_std_range']
-        blur_sigma_range = FIGURE5_FIXED_NOISE_PARAMETERS['blur_sigma_range']
+        low_frequency_noise_range = FIGURE2_FIXED_NOISE_PARAMETERS['low_frequency_noise_range']
+        low_frequency_sigma_fraction_range = FIGURE2_FIXED_NOISE_PARAMETERS['low_frequency_sigma_fraction_range']
+        read_noise_std_range = FIGURE2_FIXED_NOISE_PARAMETERS['read_noise_std_range']
+        blur_sigma_range = FIGURE2_FIXED_NOISE_PARAMETERS['blur_sigma_range']
     else:
         background_range = (0.04, 0.32)
         gradient_range = (-0.08, 0.08)
@@ -1302,7 +3970,7 @@ def _plot_ground_truth_for_figure(
     ax.set_yticks([])
 
 
-def make_figure_4(args: argparse.Namespace) -> Path:
+def make_ws2_edge_comparison(args: argparse.Namespace) -> Path:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
@@ -1365,7 +4033,7 @@ def make_figure_4(args: argparse.Namespace) -> Path:
             show_legend=column == 1,
         )
 
-    output_path = output_dir / 'figure4_ws2_edge_model_comparison.png'
+    output_path = output_dir / 'ws2_edge_edge_model_comparison.png'
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
 
@@ -1416,7 +4084,7 @@ def make_figure_4(args: argparse.Namespace) -> Path:
             for key, value in predictions.items()
         },
     }
-    (output_dir / 'figure4_ws2_edge_model_comparison.json').write_text(json.dumps(summary, indent=2))
+    (output_dir / 'ws2_edge_edge_model_comparison.json').write_text(json.dumps(summary, indent=2))
     return output_path
 
 
@@ -1449,7 +4117,7 @@ def _localization_metric_summary(classes: dict[str, Any]) -> dict[str, float | i
     }
 
 
-def make_figure_5(args: argparse.Namespace) -> Path:
+def make_figure_2(args: argparse.Namespace) -> Path:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
@@ -1464,34 +4132,37 @@ def make_figure_5(args: argparse.Namespace) -> Path:
         spec.key: _load_blobnet_model(spec.checkpoint, device, args.num_filters, args.dropout)
         for spec in models
     }
-    figure5_counts = (64.0, 64.0)
-    figure5_image_border_exclusion_px = 10.0
+    figure2_counts = (64.0, 64.0)
+    figure2_image_border_exclusion_px = 10.0
     cases = [
-        ('mos2_edge', _make_mos2_edge_record(shape, args.seed, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
-        ('srtio3_edge', _make_sto_edge_record(shape, args.seed + 101, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
-        ('graphene_rattled_edge', _make_graphene_rattled_edge_record(shape, args.seed + 202, sigma_range, total_counts_range=figure5_counts, quiet_background=True)),
+        ('mos2_edge', _make_mos2_edge_record(shape, args.seed, sigma_range, total_counts_range=figure2_counts, quiet_background=True)),
+        ('srtio3_edge', _make_sto_edge_record(shape, args.seed + 101, sigma_range, total_counts_range=figure2_counts, quiet_background=True)),
+        ('graphene_rattled_edge', _make_graphene_rattled_edge_record(shape, args.seed + 202, sigma_range, total_counts_range=figure2_counts, quiet_background=True)),
     ]
 
-    fig = plt.figure(figsize=(20.0, 11.4), constrained_layout=True)
-    grid = fig.add_gridspec(len(cases), 5, width_ratios=[1.05, 1.0, 1.0, 1.0, 1.0], wspace=0.05, hspace=0.05)
+    with_offsets = getattr(args, 'with_offset_diagnostics', False)
+    fig = plt.figure(figsize=(32.0 if with_offsets else 20.0, 11.4), constrained_layout=True)
+    grid = fig.add_gridspec(len(cases), 8 if with_offsets else 5,
+                            width_ratios=[1.05] + [1.0] * (7 if with_offsets else 4),
+                            wspace=0.05, hspace=0.05)
     summary: dict[str, Any] = {
-        'output_path': str(output_dir / 'figure5_edge_lattice_model_diagnostics.png'),
+        'output_path': str(output_dir / 'figure2_edge_lattice_model_diagnostics.png'),
         'seed': int(args.seed),
         'shape': [int(args.height), int(args.width)],
         'feature_sigma_range_px': [float(args.feature_sigma_min), float(args.feature_sigma_max)],
-        'poisson_total_counts_range': [float(figure5_counts[0]), float(figure5_counts[1])],
+        'poisson_total_counts_range': [float(figure2_counts[0]), float(figure2_counts[1])],
         'background_profile': 'fixed_noise_poisson_count_64_lowfreq_0.08_no_gradient',
         'noise_parameters': {
             key: [float(value[0]), float(value[1])]
-            for key, value in FIGURE5_FIXED_NOISE_PARAMETERS.items()
+            for key, value in FIGURE2_FIXED_NOISE_PARAMETERS.items()
         },
-        'threshold_selection_note': FIGURE5_THRESHOLD_NOTE,
+        'threshold_selection_note': FIGURE2_THRESHOLD_NOTE,
         'localization_settings': {
             'threshold_rel': float(args.localization_threshold_rel),
             'match_distance_px': float(args.localization_match_distance),
             'peak_min_distance_px': int(args.peak_min_distance),
             'peak_window_size_px': int(args.peak_window_size),
-            'image_border_exclusion_px': float(figure5_image_border_exclusion_px),
+            'image_border_exclusion_px': float(figure2_image_border_exclusion_px),
         },
         'checkpoints': {spec.key: str(spec.checkpoint) for spec in models},
         'cases': {},
@@ -1511,7 +4182,7 @@ def make_figure_5(args: argparse.Namespace) -> Path:
             spec.key: _predict_array(loaded_models[spec.key], image, device)
             for spec in models
         }
-        case_threshold = FIGURE5_TUNED_THRESHOLDS[case_key]
+        case_threshold = FIGURE2_TUNED_THRESHOLDS[case_key]
         case_thresholds = {spec.key: case_threshold for spec in models}
         case_localization = {
             spec.key: _localization_classes_for_figure_with_image_border_exclusion(
@@ -1522,7 +4193,7 @@ def make_figure_5(args: argparse.Namespace) -> Path:
                 peak_window_size=args.peak_window_size,
                 match_distance=args.localization_match_distance,
                 shape=shape,
-                border_px=figure5_image_border_exclusion_px,
+                border_px=figure2_image_border_exclusion_px,
             )
             for spec in models
         }
@@ -1537,6 +4208,33 @@ def make_figure_5(args: argparse.Namespace) -> Path:
                 show_legend=True,
                 marker_color=MODEL_COLORS.get(spec.key, '#2e7d32'),
             )
+
+        if with_offsets:
+            for column, spec in enumerate(models, start=5):
+                classes = case_localization[spec.key]
+                offsets = (classes['matched_predicted'] - classes['true_positives'])[:, ::-1]
+                ax = fig.add_subplot(grid[row, column])
+                if len(offsets):
+                    # Single-example histograms produce isolated black one-count
+                    # bins beneath the points. Show all offsets directly in the
+                    # same model colors as Figure 1, without that raster layer.
+                    ax.scatter(offsets[:, 0], offsets[:, 1], s=3, c=MODEL_COLORS[spec.key],
+                               alpha=0.35, linewidths=0)
+                ax.axhline(0, color='white', linewidth=0.7, alpha=0.65)
+                ax.axvline(0, color='white', linewidth=0.7, alpha=0.65)
+                ax.set(xlim=(-2, 2), ylim=(-2, 2), aspect='equal', facecolor='#17121f',
+                       xticks=[-1, 0, 1], yticks=[-1, 0, 1])
+                metrics = _localization_metric_summary(classes)
+                rmse_label = 'N/A' if metrics['rmse'] is None else f"{metrics['rmse']:.2f}px"
+                ax.text(0.04, 0.96, f"F1={metrics['f1']:.3f}\nRMSE={rmse_label}",
+                        transform=ax.transAxes, ha='left', va='top', color='white', fontsize=ANNOTATION_SIZE)
+                if row == 0:
+                    ax.set_title({'square': 'Square-Net', 'hexagonal': 'Hex-Net', 'random': 'Blob-Net'}[spec.key],
+                                 fontsize=AXIS_LABEL_SIZE)
+                if row == len(cases) - 1:
+                    ax.set_xlabel('x offset (px)')
+                if column == 5:
+                    ax.set_ylabel('y offset (px)')
 
         summary['cases'][case_key] = {
             'image_type': str(record.get('image_type', case_key)),
@@ -1561,12 +4259,19 @@ def make_figure_5(args: argparse.Namespace) -> Path:
             },
         }
 
-    output_path = output_dir / 'figure5_edge_lattice_model_diagnostics.png'
+    output_path = output_dir / 'figure2_edge_lattice_model_diagnostics.png'
+    if with_offsets:
+        output_path = output_dir / 'fig-Blob-Net-2-with-diagnostics-draft.png'
+        summary['diagnostics_note'] = ('Offsets and F1/RMSE use the displayed example in each row, '
+                                       'rendered as model-colored scatter without a histogram underlay. '
+                                       'with the same thresholds and 10 px border exclusion as its TP/FP/FN panels. '
+                                       'Offsets are predicted minus ground truth; RMSE uses all matched points, '
+                                       'including offsets outside the displayed +/-2 px window.')
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
     summary['output_path'] = str(output_path)
-    (output_dir / 'figure5_edge_lattice_model_diagnostics.json').write_text(json.dumps(summary, indent=2))
-    (output_dir / 'figure5_threshold_note.txt').write_text(FIGURE5_THRESHOLD_NOTE + '\n')
+    output_path.with_suffix('.json').write_text(json.dumps(summary, indent=2))
+    (output_dir / 'figure2_threshold_note.txt').write_text(FIGURE2_THRESHOLD_NOTE + '\n')
     return output_path
 
 
@@ -1744,7 +4449,7 @@ def _plot_pixel_size_sweep_stack(top_ax: plt.Axes, bottom_ax: plt.Axes, rows: li
     spacing_ax.set_ylim(0.0, 1.0)
 
 
-def make_figure_3(args: argparse.Namespace) -> Path:
+def make_figure_4(args: argparse.Namespace) -> Path:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
@@ -1779,7 +4484,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
     ax_bottom = fig.add_subplot(grid[1, 3], sharex=ax_top)
     _plot_pixel_size_sweep_stack(ax_top, ax_bottom, rows)
 
-    output_path = output_dir / 'figure3_scale_spacing_robustness.png'
+    output_path = output_dir / 'figure4_scale_spacing_robustness.png'
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
     return output_path
@@ -1842,84 +4547,640 @@ def build_parser() -> argparse.ArgumentParser:
     figure1.add_argument('--offset-bins', type=int, default=48)
     figure1.set_defaults(func=make_figure_1)
 
-    figure2 = subparsers.add_parser('figure2', help='Experimental HAADF input/output figure.')
-    _add_shared_arguments(figure2)
-    _add_model_arguments(figure2)
-    figure2.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
-    figure2.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
-    figure2.add_argument('--tile-size', type=int, default=256)
-    figure2.add_argument('--tile-overlap', type=int, default=64)
-    figure2.add_argument('--batch-size', type=int, default=4)
-    figure2.add_argument('--dog-small', type=float, default=1.0)
-    figure2.add_argument('--dog-large', type=float, default=20.0)
-    figure2.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
-    figure2.add_argument('--feature-match-sigma-px', type=float, default=2.9)
-    figure2.add_argument('--experimental-crop-size', type=int, default=512)
-    figure2.set_defaults(func=make_figure_2)
-
-    figure2_localizations = subparsers.add_parser(
-        'figure2-localizations',
-        help='Experimental HAADF localization comparison with BlobNet and LoG under Poisson noise.',
-    )
-    _add_shared_arguments(figure2_localizations)
-    _add_model_arguments(figure2_localizations)
-    figure2_localizations.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
-    figure2_localizations.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
-    figure2_localizations.add_argument('--tile-size', type=int, default=256)
-    figure2_localizations.add_argument('--tile-overlap', type=int, default=64)
-    figure2_localizations.add_argument('--batch-size', type=int, default=4)
-    figure2_localizations.add_argument('--dog-small', type=float, default=1.0)
-    figure2_localizations.add_argument('--dog-large', type=float, default=20.0)
-    figure2_localizations.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
-    figure2_localizations.add_argument('--feature-match-sigma-px', type=float, default=2.9)
-    figure2_localizations.add_argument('--experimental-crop-size', type=int, default=512)
-    figure2_localizations.add_argument('--seed', type=int, default=7)
-    figure2_localizations.add_argument('--poisson-counts', type=float, default=80.0)
-    figure2_localizations.add_argument('--heavy-poisson-counts', type=float, default=28.0)
-    figure2_localizations.add_argument('--localization-threshold-rel', type=float, default=0.35)
-    figure2_localizations.add_argument('--peak-min-distance', type=int, default=3)
-    figure2_localizations.add_argument('--peak-window-size', type=int, default=5)
-    figure2_localizations.add_argument('--max-peaks', type=int)
-    figure2_localizations.add_argument('--log-sigma-px', type=float, default=2.9)
-    figure2_localizations.add_argument('--log-threshold-rel', type=float, default=0.35)
-    figure2_localizations.add_argument('--log-min-distance', type=int, default=5)
-    figure2_localizations.set_defaults(func=make_figure_2_localizations)
-
-    figure3 = subparsers.add_parser('figure3', help='Scale and spacing robustness figure.')
+    figure3 = subparsers.add_parser('figure3', help='Experimental HAADF input/output figure.')
     _add_shared_arguments(figure3)
     _add_model_arguments(figure3)
-    _add_feature_size_arguments(figure3)
-    figure3.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
-    figure3.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
-    figure3.add_argument('--sweep-dataset-config', type=Path)
-    figure3.add_argument('--sweep-samples', type=int, default=64)
-    figure3.add_argument('--sweep-pixel-size-factors', type=_parse_float_list)
-    figure3.add_argument('--sweep-threshold-grid', type=_parse_float_list)
-    figure3.add_argument('--regenerate-sweep', action='store_true')
-    figure3.add_argument('--batch-size', type=int, default=8)
+    figure3.add_argument(
+        '--checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
+    figure3.add_argument('--tile-size', type=int, default=256)
+    figure3.add_argument('--tile-overlap', type=int, default=64)
+    figure3.add_argument('--batch-size', type=int, default=4)
+    figure3.add_argument('--dog-small', type=float, default=1.0)
+    figure3.add_argument('--dog-large', type=float, default=20.0)
+    figure3.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
+    figure3.add_argument('--feature-match-sigma-px', type=float, default=2.9)
+    figure3.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3.add_argument(
+        '--quasicrystal-image',
+        type=Path,
+        default=repo_root / 'experimental_data/QuasiCrystal_4p60Mx_20260717.emd',
+    )
+    figure3.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    figure3.add_argument(
+        '--fourth-image', type=Path,
+        default=repo_root / 'experimental_data/0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+    )
+    figure3.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3.add_argument('--peak-min-distance', type=int, default=3)
+    figure3.add_argument('--peak-window-size', type=int, default=5)
+    figure3.add_argument('--marker-size', type=float, default=40.0)
+    figure3.add_argument('--marker-linewidth', type=float, default=1.8)
+    figure3.add_argument('--marker-color', default='#D55E00')
+    figure3.add_argument('--marker-edge-color', default='white')
+    figure3.add_argument('--hexagonal-checkpoint', type=Path,
+                         default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
+    figure3.add_argument(
+        '--ws2-hexagonal-pixel-size-factor', type=float, default=0.70,
+        help='Hex-Net pixel-size factor for the first-column WS2 image; Blob-Net remains at 1.0.',
+    )
+    figure3.add_argument(
+        '--ws2-hexagonal-threshold-rel', type=float, default=0.30,
+        help='Hex-Net localization cutoff for the first-column WS2 image.',
+    )
+    figure3.add_argument('--save-pdf', action='store_true')
+    figure3.add_argument('--agreement-radius-nm', type=float, default=0.06)
+    figure3.add_argument('--both-color', default=MODEL_COLORS['random'])
+    figure3.add_argument('--hex-only-color', default=MODEL_COLORS['hexagonal'])
+    figure3.add_argument('--blob-only-color', default=MODEL_COLORS['square'])
+    figure3.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3.add_argument('--scale-bar-linewidth', type=float, default=4.0)
     figure3.set_defaults(func=make_figure_3)
 
-    figure4 = subparsers.add_parser('figure4', help='Simulated WS2 monolayer flake edge model comparison.')
+    figure3b = subparsers.add_parser(
+        'figure3b',
+        help='Experimental Figure 3 comparison with Blob-Net and hexagonal-model localization rows.',
+    )
+    _add_shared_arguments(figure3b)
+    _add_model_arguments(figure3b)
+    figure3b.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3b.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3b.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
+    figure3b.add_argument('--tile-size', type=int, default=256)
+    figure3b.add_argument('--tile-overlap', type=int, default=64)
+    figure3b.add_argument('--batch-size', type=int, default=4)
+    figure3b.add_argument('--dog-small', type=float, default=1.0)
+    figure3b.add_argument('--dog-large', type=float, default=20.0)
+    figure3b.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3b.add_argument(
+        '--quasicrystal-image',
+        type=Path,
+        default=repo_root / 'experimental_data/QuasiCrystal_4p60Mx_20260717.emd',
+    )
+    figure3b.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    figure3b.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3b.add_argument('--peak-min-distance', type=int, default=3)
+    figure3b.add_argument('--peak-window-size', type=int, default=5)
+    figure3b.add_argument('--marker-size', type=float, default=40.0)
+    figure3b.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3b.add_argument('--marker-edge-color', default='white')
+    figure3b.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3b.add_argument('--hexagonal-marker-color', default=MODEL_COLORS['hexagonal'])
+    figure3b.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3b.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3b.set_defaults(func=make_figure_3b)
+
+    figure3c = subparsers.add_parser(
+        'figure3c',
+        help='Figure 3b-style comparison for four multi-frame Velox HAADF images.',
+    )
+    _add_shared_arguments(figure3c)
+    _add_model_arguments(figure3c)
+    figure3c.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c.add_argument('--images', type=Path, nargs=4, required=True)
+    figure3c.add_argument('--tile-size', type=int, default=256)
+    figure3c.add_argument('--tile-overlap', type=int, default=64)
+    figure3c.add_argument('--batch-size', type=int, default=4)
+    figure3c.add_argument('--dog-small', type=float, default=1.0)
+    figure3c.add_argument('--dog-large', type=float, default=20.0)
+    figure3c.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    figure3c.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3c.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c.add_argument('--peak-window-size', type=int, default=5)
+    figure3c.add_argument('--marker-size', type=float, default=40.0)
+    figure3c.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c.add_argument('--marker-edge-color', default='white')
+    figure3c.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c.add_argument('--hexagonal-marker-color', default=MODEL_COLORS['hexagonal'])
+    figure3c.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c.set_defaults(func=make_figure_3c)
+
+    figure3c_cutoffs = subparsers.add_parser(
+        'figure3c-cutoff-sweep',
+        help='Sweep localization cutoffs for both Figure 3C models on one Velox HAADF image.',
+    )
+    _add_shared_arguments(figure3c_cutoffs)
+    _add_model_arguments(figure3c_cutoffs)
+    figure3c_cutoffs.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_cutoffs.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c_cutoffs.add_argument('--image', type=Path, required=True)
+    figure3c_cutoffs.add_argument('--tile-size', type=int, default=256)
+    figure3c_cutoffs.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_cutoffs.add_argument('--batch-size', type=int, default=4)
+    figure3c_cutoffs.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_cutoffs.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_cutoffs.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c_cutoffs.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    figure3c_cutoffs.add_argument('--cutoff-min', type=float, default=0.10)
+    figure3c_cutoffs.add_argument('--cutoff-max', type=float, default=0.40)
+    figure3c_cutoffs.add_argument('--steps', type=int, default=7)
+    figure3c_cutoffs.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_cutoffs.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_cutoffs.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_cutoffs.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c_cutoffs.add_argument('--marker-edge-color', default='white')
+    figure3c_cutoffs.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c_cutoffs.add_argument('--hexagonal-marker-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_cutoffs.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_cutoffs.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_cutoffs.set_defaults(func=make_figure_3c_cutoff_sweep)
+
+    figure3c_agreement_cutoffs = subparsers.add_parser(
+        'figure3c-agreement-cutoff-sweep',
+        help='Sweep cutoffs and compare matched Blob-Net and Hex-Net predictions on the 0063 crop.',
+    )
+    _add_shared_arguments(figure3c_agreement_cutoffs)
+    _add_model_arguments(figure3c_agreement_cutoffs)
+    figure3c_agreement_cutoffs.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_agreement_cutoffs.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c_agreement_cutoffs.add_argument(
+        '--image',
+        type=Path,
+        default=repo_root / 'experimental_data/0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+    )
+    figure3c_agreement_cutoffs.add_argument(
+        '--standard-emd', action='store_true',
+        help='Read the standard experimental Channel_000 image instead of a Velox displayed-series frame.',
+    )
+    figure3c_agreement_cutoffs.add_argument('--tile-size', type=int, default=256)
+    figure3c_agreement_cutoffs.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_agreement_cutoffs.add_argument('--batch-size', type=int, default=4)
+    figure3c_agreement_cutoffs.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_agreement_cutoffs.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_agreement_cutoffs.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c_agreement_cutoffs.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    figure3c_agreement_cutoffs.add_argument('--cutoff-min', type=float, default=0.10)
+    figure3c_agreement_cutoffs.add_argument('--cutoff-max', type=float, default=0.40)
+    figure3c_agreement_cutoffs.add_argument('--steps', type=int, default=7)
+    figure3c_agreement_cutoffs.add_argument(
+        '--cutoffs', type=_parse_float_list, default=None,
+        help='Optional explicit cutoff list, overriding cutoff-min, cutoff-max, and steps.',
+    )
+    figure3c_agreement_cutoffs.add_argument(
+        '--fixed-blobnet-cutoff', type=float, default=None,
+        help='Keep Blob-Net at this cutoff while sweeping the listed cutoffs only for Hex-Net.',
+    )
+    figure3c_agreement_cutoffs.add_argument('--agreement-radius-nm', type=float, default=0.06)
+    figure3c_agreement_cutoffs.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_agreement_cutoffs.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_agreement_cutoffs.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_agreement_cutoffs.add_argument('--marker-linewidth', type=float, default=1.8)
+    figure3c_agreement_cutoffs.add_argument('--both-color', default=MODEL_COLORS['random'])
+    figure3c_agreement_cutoffs.add_argument('--hex-only-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_agreement_cutoffs.add_argument('--blob-only-color', default=MODEL_COLORS['square'])
+    figure3c_agreement_cutoffs.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_agreement_cutoffs.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_agreement_cutoffs.set_defaults(func=make_figure_3c_agreement_cutoff_sweep)
+
+    figure3c_normalization = subparsers.add_parser(
+        'figure3c-normalization-sweep',
+        help='Sweep robust upper-percentile clipping for both models on the 0063 crop.',
+    )
+    _add_shared_arguments(figure3c_normalization)
+    _add_model_arguments(figure3c_normalization)
+    figure3c_normalization.add_argument(
+        '--blobnet-checkpoint', type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_normalization.add_argument(
+        '--hexagonal-checkpoint', type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c_normalization.add_argument(
+        '--image', type=Path,
+        default=repo_root / 'experimental_data/0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+    )
+    figure3c_normalization.add_argument('--tile-size', type=int, default=256)
+    figure3c_normalization.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_normalization.add_argument('--batch-size', type=int, default=4)
+    figure3c_normalization.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_normalization.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_normalization.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c_normalization.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    figure3c_normalization.add_argument('--lower-percentile', type=float, default=1.0)
+    figure3c_normalization.add_argument(
+        '--upper-percentiles', type=_parse_float_list,
+        default=[99.8, 99.5, 99.0, 98.0, 97.0],
+    )
+    figure3c_normalization.add_argument(
+        '--gammas', type=_parse_float_list, default=None,
+        help='Optional intensity powers, one per upper percentile (1.0 is linear; lower values brighten dim sites).',
+    )
+    figure3c_normalization.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3c_normalization.add_argument('--agreement-radius-nm', type=float, default=0.06)
+    figure3c_normalization.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_normalization.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_normalization.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_normalization.add_argument('--marker-linewidth', type=float, default=1.8)
+    figure3c_normalization.add_argument('--both-color', default=MODEL_COLORS['random'])
+    figure3c_normalization.add_argument('--hex-only-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_normalization.add_argument('--blob-only-color', default=MODEL_COLORS['square'])
+    figure3c_normalization.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_normalization.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_normalization.set_defaults(func=make_figure_3c_normalization_sweep)
+
+    figure3c_pixel_sizes = subparsers.add_parser(
+        'figure3c-pixel-size-sweep',
+        help='Sweep physical pixel sizes for both Figure 3C models while keeping the field of view fixed.',
+    )
+    _add_shared_arguments(figure3c_pixel_sizes)
+    _add_model_arguments(figure3c_pixel_sizes)
+    figure3c_pixel_sizes.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_pixel_sizes.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c_pixel_sizes.add_argument('--image', type=Path, required=True)
+    figure3c_pixel_sizes.add_argument(
+        '--standard-emd', action='store_true',
+        help='Read the standard experimental Channel_000 image instead of a Velox displayed-series frame.',
+    )
+    figure3c_pixel_sizes.add_argument('--tile-size', type=int, default=256)
+    figure3c_pixel_sizes.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_pixel_sizes.add_argument('--batch-size', type=int, default=4)
+    figure3c_pixel_sizes.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_pixel_sizes.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_pixel_sizes.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c_pixel_sizes.add_argument('--base-pixel-size-nm', type=float, default=0.05438625774982139)
+    figure3c_pixel_sizes.add_argument(
+        '--pixel-size-factors',
+        type=_parse_float_list,
+        default=[0.25, 0.5, 1.0],
+    )
+    figure3c_pixel_sizes.add_argument(
+        '--fixed-blobnet-factor', type=float, default=None,
+        help='Keep Blob-Net at this factor while sweeping the listed factors only for Hex-Net.',
+    )
+    figure3c_pixel_sizes.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3c_pixel_sizes.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_pixel_sizes.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_pixel_sizes.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_pixel_sizes.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c_pixel_sizes.add_argument('--marker-edge-color', default='white')
+    figure3c_pixel_sizes.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c_pixel_sizes.add_argument('--hexagonal-marker-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_pixel_sizes.add_argument('--combined-overlay', action='store_true')
+    figure3c_pixel_sizes.add_argument('--comparison-hexagonal-marker-color', default='#56B4E9')
+    figure3c_pixel_sizes.add_argument('--agreement-overlay', action='store_true')
+    figure3c_pixel_sizes.add_argument('--agreement-radius-nm', type=float, default=0.06)
+    figure3c_pixel_sizes.add_argument('--agreement-marker-linewidth', type=float, default=1.8)
+    figure3c_pixel_sizes.add_argument('--both-color', default=MODEL_COLORS['random'])
+    figure3c_pixel_sizes.add_argument('--hex-only-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_pixel_sizes.add_argument('--blob-only-color', default=MODEL_COLORS['square'])
+    figure3c_pixel_sizes.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_pixel_sizes.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_pixel_sizes.set_defaults(func=make_figure_3c_pixel_size_sweep)
+
+    ws2_edge_hex_grid = subparsers.add_parser(
+        'figure3-ws2-hexnet-pixel-cutoff-grid',
+        help='Grid Hex-Net WS2 overlays by physical pixel-size factor and localization cutoff.',
+    )
+    _add_shared_arguments(ws2_edge_hex_grid)
+    _add_model_arguments(ws2_edge_hex_grid)
+    ws2_edge_hex_grid.add_argument(
+        '--hexagonal-checkpoint', type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    ws2_edge_hex_grid.add_argument(
+        '--image', type=Path, default=repo_root / 'experimental_data/WS2.emd',
+    )
+    ws2_edge_hex_grid.add_argument('--tile-size', type=int, default=256)
+    ws2_edge_hex_grid.add_argument('--tile-overlap', type=int, default=64)
+    ws2_edge_hex_grid.add_argument('--batch-size', type=int, default=4)
+    ws2_edge_hex_grid.add_argument('--dog-small', type=float, default=1.0)
+    ws2_edge_hex_grid.add_argument('--dog-large', type=float, default=20.0)
+    ws2_edge_hex_grid.add_argument('--experimental-crop-size', type=int, default=512)
+    ws2_edge_hex_grid.add_argument('--base-pixel-size-nm', type=float, default=0.027193128874910695)
+    ws2_edge_hex_grid.add_argument(
+        '--pixel-size-factors', type=_parse_float_list,
+        default=[0.70, 0.75, 0.80, 0.85, 0.90, 1.00],
+    )
+    ws2_edge_hex_grid.add_argument(
+        '--cutoffs', type=_parse_float_list, default=[0.01, 0.05, 0.10, 0.20, 0.35],
+    )
+    ws2_edge_hex_grid.add_argument('--peak-min-distance', type=int, default=3)
+    ws2_edge_hex_grid.add_argument('--peak-window-size', type=int, default=5)
+    ws2_edge_hex_grid.add_argument('--marker-size', type=float, default=30.0)
+    ws2_edge_hex_grid.add_argument('--marker-linewidth', type=float, default=1.4)
+    ws2_edge_hex_grid.add_argument('--hexnet-color', default=MODEL_COLORS['hexagonal'])
+    ws2_edge_hex_grid.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    ws2_edge_hex_grid.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    ws2_edge_hex_grid.set_defaults(func=make_figure_3_ws2_hexnet_pixel_cutoff_grid)
+
+    figure3c_fov_sweep = subparsers.add_parser(
+        'figure3c-fov-sweep',
+        help='Compare centered fields of view at one physical inference pixel size.',
+    )
+    _add_shared_arguments(figure3c_fov_sweep)
+    _add_model_arguments(figure3c_fov_sweep)
+    figure3c_fov_sweep.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_fov_sweep.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c_fov_sweep.add_argument('--image', type=Path, required=True)
+    figure3c_fov_sweep.add_argument('--crop-sizes', type=int, nargs='+', default=[512, 1024, 2048])
+    figure3c_fov_sweep.add_argument('--tile-size', type=int, default=256)
+    figure3c_fov_sweep.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_fov_sweep.add_argument('--batch-size', type=int, default=4)
+    figure3c_fov_sweep.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_fov_sweep.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_fov_sweep.add_argument('--target-pixel-size-nm', type=float, default=0.013596564437455348)
+    figure3c_fov_sweep.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3c_fov_sweep.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_fov_sweep.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_fov_sweep.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_fov_sweep.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c_fov_sweep.add_argument('--marker-edge-color', default='white')
+    figure3c_fov_sweep.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c_fov_sweep.add_argument('--hexagonal-marker-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_fov_sweep.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_fov_sweep.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_fov_sweep.set_defaults(func=make_figure_3c_fov_sweep)
+
+    figure3c_region_atlas = subparsers.add_parser(
+        'figure3c-region-atlas',
+        help='Tile a full Velox frame into regional localization atlases for both models.',
+    )
+    _add_shared_arguments(figure3c_region_atlas)
+    _add_model_arguments(figure3c_region_atlas)
+    figure3c_region_atlas.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_region_atlas.add_argument(
+        '--hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+    )
+    figure3c_region_atlas.add_argument('--image', type=Path, required=True)
+    figure3c_region_atlas.add_argument('--grid-size', type=int, default=4)
+    figure3c_region_atlas.add_argument('--region-size', type=int, default=512)
+    figure3c_region_atlas.add_argument('--tile-size', type=int, default=256)
+    figure3c_region_atlas.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_region_atlas.add_argument('--batch-size', type=int, default=4)
+    figure3c_region_atlas.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_region_atlas.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_region_atlas.add_argument('--target-pixel-size-nm', type=float, default=0.013596564437455348)
+    figure3c_region_atlas.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3c_region_atlas.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_region_atlas.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_region_atlas.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_region_atlas.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c_region_atlas.add_argument('--marker-edge-color', default='white')
+    figure3c_region_atlas.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c_region_atlas.add_argument('--hexagonal-marker-color', default=MODEL_COLORS['hexagonal'])
+    figure3c_region_atlas.add_argument('--comparison-hexagonal-marker-color', default='#56B4E9')
+    figure3c_region_atlas.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_region_atlas.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_region_atlas.set_defaults(func=make_figure_3c_region_atlas)
+
+    figure3c_sqrt_input = subparsers.add_parser(
+        'figure3c-sqrt-input',
+        help='Compare standard and square-root-transformed inputs for Blob-Net on one Velox HAADF image.',
+    )
+    _add_shared_arguments(figure3c_sqrt_input)
+    _add_model_arguments(figure3c_sqrt_input)
+    figure3c_sqrt_input.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_sqrt_input.add_argument('--image', type=Path, required=True)
+    figure3c_sqrt_input.add_argument('--tile-size', type=int, default=256)
+    figure3c_sqrt_input.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_sqrt_input.add_argument('--batch-size', type=int, default=4)
+    figure3c_sqrt_input.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_sqrt_input.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_sqrt_input.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c_sqrt_input.add_argument('--target-pixel-size-nm', type=float, default=0.013596564437455348)
+    figure3c_sqrt_input.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3c_sqrt_input.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_sqrt_input.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_sqrt_input.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_sqrt_input.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c_sqrt_input.add_argument('--marker-edge-color', default='white')
+    figure3c_sqrt_input.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c_sqrt_input.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_sqrt_input.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_sqrt_input.set_defaults(func=make_figure_3c_sqrt_input)
+
+    figure3c_low_cutoffs = subparsers.add_parser(
+        'figure3c-blobnet-cutoff-gallery',
+        help='Show a compact low-cutoff gallery for Blob-Net on one Velox HAADF image.',
+    )
+    _add_shared_arguments(figure3c_low_cutoffs)
+    _add_model_arguments(figure3c_low_cutoffs)
+    figure3c_low_cutoffs.add_argument(
+        '--blobnet-checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3c_low_cutoffs.add_argument('--image', type=Path, required=True)
+    figure3c_low_cutoffs.add_argument('--tile-size', type=int, default=256)
+    figure3c_low_cutoffs.add_argument('--tile-overlap', type=int, default=64)
+    figure3c_low_cutoffs.add_argument('--batch-size', type=int, default=4)
+    figure3c_low_cutoffs.add_argument('--dog-small', type=float, default=1.0)
+    figure3c_low_cutoffs.add_argument('--dog-large', type=float, default=20.0)
+    figure3c_low_cutoffs.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3c_low_cutoffs.add_argument('--target-pixel-size-nm', type=float, default=0.013596564437455348)
+    figure3c_low_cutoffs.add_argument('--cutoff-min', type=float, default=0.01)
+    figure3c_low_cutoffs.add_argument('--cutoff-max', type=float, default=0.15)
+    figure3c_low_cutoffs.add_argument('--steps', type=int, default=15)
+    figure3c_low_cutoffs.add_argument('--peak-min-distance', type=int, default=3)
+    figure3c_low_cutoffs.add_argument('--peak-window-size', type=int, default=5)
+    figure3c_low_cutoffs.add_argument('--marker-size', type=float, default=40.0)
+    figure3c_low_cutoffs.add_argument('--marker-linewidth', type=float, default=0.2)
+    figure3c_low_cutoffs.add_argument('--marker-edge-color', default='white')
+    figure3c_low_cutoffs.add_argument('--blobnet-marker-color', default='#D55E00')
+    figure3c_low_cutoffs.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    figure3c_low_cutoffs.add_argument('--scale-bar-linewidth', type=float, default=4.0)
+    figure3c_low_cutoffs.set_defaults(func=make_figure_3c_blobnet_cutoff_gallery)
+
+    quasicrystal_sweep = subparsers.add_parser(
+        'quasicrystal-scale-sweep',
+        help='Compare BlobNet predictions across interpolated quasicrystal pixel scales.',
+    )
+    _add_shared_arguments(quasicrystal_sweep)
+    _add_model_arguments(quasicrystal_sweep)
+    quasicrystal_sweep.add_argument(
+        '--checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    quasicrystal_sweep.add_argument('--image', type=Path, default=repo_root / 'experimental_data/QuasiCrystal.emd')
+    quasicrystal_sweep.add_argument('--tile-size', type=int, default=256)
+    quasicrystal_sweep.add_argument('--tile-overlap', type=int, default=64)
+    quasicrystal_sweep.add_argument('--batch-size', type=int, default=4)
+    quasicrystal_sweep.add_argument('--dog-small', type=float, default=1.0)
+    quasicrystal_sweep.add_argument('--dog-large', type=float, default=20.0)
+    quasicrystal_sweep.add_argument('--crop-size', type=int, default=512)
+    quasicrystal_sweep.add_argument('--scale-min', type=float, default=0.5)
+    quasicrystal_sweep.add_argument('--scale-max', type=float, default=1.5)
+    quasicrystal_sweep.add_argument('--steps', type=int, default=20)
+    quasicrystal_sweep.add_argument('--threshold-rel', type=float, default=0.35)
+    quasicrystal_sweep.add_argument('--peak-min-distance', type=int, default=3)
+    quasicrystal_sweep.add_argument('--peak-window-size', type=int, default=5)
+    quasicrystal_sweep.set_defaults(func=make_quasicrystal_scale_sweep)
+
+    common_pixel_size = subparsers.add_parser(
+        'quasicrystal-common-pixel-size',
+        help='Compare quasicrystal predictions at one common physical pixel size without changing FOV.',
+    )
+    _add_shared_arguments(common_pixel_size)
+    _add_model_arguments(common_pixel_size)
+    common_pixel_size.add_argument(
+        '--checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    common_pixel_size.add_argument('--images', type=Path, nargs=3, required=True)
+    common_pixel_size.add_argument('--target-pixel-size-nm', type=float)
+    common_pixel_size.add_argument('--tile-size', type=int, default=256)
+    common_pixel_size.add_argument('--tile-overlap', type=int, default=64)
+    common_pixel_size.add_argument('--batch-size', type=int, default=4)
+    common_pixel_size.add_argument('--dog-small', type=float, default=1.0)
+    common_pixel_size.add_argument('--dog-large', type=float, default=20.0)
+    common_pixel_size.add_argument('--crop-size', type=int, default=512)
+    common_pixel_size.set_defaults(func=make_quasicrystal_common_pixel_size)
+
+    figure3_pixel_sweep = subparsers.add_parser(
+        'figure3-pixel-size-sweep',
+        help='Sweep one common physical pixel size across all three Figure 3 images without changing FOV.',
+    )
+    _add_shared_arguments(figure3_pixel_sweep)
+    _add_model_arguments(figure3_pixel_sweep)
+    figure3_pixel_sweep.add_argument(
+        '--checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
+    figure3_pixel_sweep.add_argument('--images', type=Path, nargs=3, required=True)
+    figure3_pixel_sweep.add_argument('--base-pixel-size-nm', type=float, required=True)
+    figure3_pixel_sweep.add_argument('--factor-min', type=float, default=0.7)
+    figure3_pixel_sweep.add_argument('--factor-max', type=float, default=1.3)
+    figure3_pixel_sweep.add_argument('--steps', type=int, default=20)
+    figure3_pixel_sweep.add_argument('--tile-size', type=int, default=256)
+    figure3_pixel_sweep.add_argument('--tile-overlap', type=int, default=64)
+    figure3_pixel_sweep.add_argument('--batch-size', type=int, default=4)
+    figure3_pixel_sweep.add_argument('--dog-small', type=float, default=1.0)
+    figure3_pixel_sweep.add_argument('--dog-large', type=float, default=20.0)
+    figure3_pixel_sweep.add_argument('--crop-size', type=int, default=512)
+    figure3_pixel_sweep.set_defaults(func=make_figure3_pixel_size_sweep)
+
+    figure3_localizations = subparsers.add_parser(
+        'figure3-localizations',
+        help='Experimental HAADF localization comparison with BlobNet and LoG under Poisson noise.',
+    )
+    _add_shared_arguments(figure3_localizations)
+    _add_model_arguments(figure3_localizations)
+    figure3_localizations.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure3_localizations.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
+    figure3_localizations.add_argument('--tile-size', type=int, default=256)
+    figure3_localizations.add_argument('--tile-overlap', type=int, default=64)
+    figure3_localizations.add_argument('--batch-size', type=int, default=4)
+    figure3_localizations.add_argument('--dog-small', type=float, default=1.0)
+    figure3_localizations.add_argument('--dog-large', type=float, default=20.0)
+    figure3_localizations.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
+    figure3_localizations.add_argument('--feature-match-sigma-px', type=float, default=2.9)
+    figure3_localizations.add_argument('--experimental-crop-size', type=int, default=512)
+    figure3_localizations.add_argument('--seed', type=int, default=7)
+    figure3_localizations.add_argument('--poisson-counts', type=float, default=80.0)
+    figure3_localizations.add_argument('--heavy-poisson-counts', type=float, default=28.0)
+    figure3_localizations.add_argument('--localization-threshold-rel', type=float, default=0.35)
+    figure3_localizations.add_argument('--peak-min-distance', type=int, default=3)
+    figure3_localizations.add_argument('--peak-window-size', type=int, default=5)
+    figure3_localizations.add_argument('--max-peaks', type=int)
+    figure3_localizations.add_argument('--log-sigma-px', type=float, default=2.9)
+    figure3_localizations.add_argument('--log-threshold-rel', type=float, default=0.35)
+    figure3_localizations.add_argument('--log-min-distance', type=int, default=5)
+    figure3_localizations.set_defaults(func=make_figure_3_localizations)
+
+    figure4 = subparsers.add_parser('figure4', help='Scale and spacing robustness figure.')
     _add_shared_arguments(figure4)
     _add_model_arguments(figure4)
     _add_feature_size_arguments(figure4)
-    figure4.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
-    figure4.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    figure4.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random_dense/unet_best.pth')
-    figure4.add_argument('--seed', type=int, default=41)
-    _add_edge_localization_arguments(figure4)
+    figure4.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure4.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
+    figure4.add_argument('--sweep-dataset-config', type=Path)
+    figure4.add_argument('--sweep-samples', type=int, default=64)
+    figure4.add_argument('--sweep-pixel-size-factors', type=_parse_float_list)
+    figure4.add_argument('--sweep-threshold-grid', type=_parse_float_list)
+    figure4.add_argument('--regenerate-sweep', action='store_true')
+    figure4.add_argument('--batch-size', type=int, default=8)
     figure4.set_defaults(func=make_figure_4)
 
-    figure5 = subparsers.add_parser('figure5', help='Edge-structure TP/FP/FN diagnostics for WS2, SrTiO3, and graphene.')
-    _add_shared_arguments(figure5)
-    _add_model_arguments(figure5)
-    _add_feature_size_arguments(figure5)
-    figure5.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
-    figure5.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    figure5.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
-    figure5.add_argument('--seed', type=int, default=41)
-    _add_edge_localization_arguments(figure5)
-    figure5.set_defaults(func=make_figure_5, feature_sigma_min=1.15, feature_sigma_max=2.65)
+    ws2_edge_comparison = subparsers.add_parser('ws2-edge-comparison', help='Simulated WS2 monolayer flake edge model comparison.')
+    _add_shared_arguments(ws2_edge_comparison)
+    _add_model_arguments(ws2_edge_comparison)
+    _add_feature_size_arguments(ws2_edge_comparison)
+    ws2_edge_comparison.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
+    ws2_edge_comparison.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
+    ws2_edge_comparison.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random_dense/unet_best.pth')
+    ws2_edge_comparison.add_argument('--seed', type=int, default=41)
+    _add_edge_localization_arguments(ws2_edge_comparison)
+    ws2_edge_comparison.set_defaults(func=make_ws2_edge_comparison)
+
+    figure2 = subparsers.add_parser('figure2', help='Edge-structure TP/FP/FN diagnostics for WS2, SrTiO3, and graphene.')
+    _add_shared_arguments(figure2)
+    _add_model_arguments(figure2)
+    _add_feature_size_arguments(figure2)
+    figure2.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
+    figure2.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
+    figure2.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure2.add_argument('--seed', type=int, default=41)
+    figure2.add_argument('--with-offset-diagnostics', action='store_true')
+    _add_edge_localization_arguments(figure2)
+    figure2.set_defaults(func=make_figure_2, feature_sigma_min=1.15, feature_sigma_max=2.65)
 
     all_parser = subparsers.add_parser('all', help='Build all manuscript figures.')
     _add_shared_arguments(all_parser)
@@ -1930,7 +5191,11 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
     all_parser.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
     all_parser.add_argument('--ws2-random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random_dense/unet_best.pth')
-    all_parser.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    all_parser.add_argument(
+        '--checkpoint',
+        type=Path,
+        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+    )
     all_parser.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     all_parser.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
     all_parser.add_argument('--sweep-dataset-config', type=Path)
@@ -1952,8 +5217,20 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument('--experimental-measurements', type=Path, default=repo_root / 'outputs/experimental_feature_measurements_local/experimental_feature_measurements.json')
     all_parser.add_argument('--feature-match-sigma-px', type=float, default=2.9)
     all_parser.add_argument('--experimental-crop-size', type=int, default=512)
+    all_parser.add_argument(
+        '--quasicrystal-image',
+        type=Path,
+        default=repo_root / 'experimental_data/QuasiCrystal_4p60Mx_20260717.emd',
+    )
+    all_parser.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    all_parser.add_argument('--marker-size', type=float, default=40.0)
+    all_parser.add_argument('--marker-linewidth', type=float, default=0.2)
+    all_parser.add_argument('--marker-color', default='#D55E00')
+    all_parser.add_argument('--marker-edge-color', default='white')
+    all_parser.add_argument('--scale-bar-length-nm', type=float, default=1.0)
+    all_parser.add_argument('--scale-bar-linewidth', type=float, default=4.0)
     _add_edge_localization_arguments(all_parser)
-    all_parser.set_defaults(func=None)
+    all_parser.set_defaults(func=None, localization_threshold_rel=0.35)
     return parser
 
 
@@ -1966,11 +5243,11 @@ def main() -> int:
             make_figure_1(args),
             make_figure_2(args),
             make_figure_3(args),
+            make_figure_4(args),
         ]
         args.random_checkpoint = args.ws2_random_checkpoint
-        paths.append(make_figure_4(args))
+        paths.append(make_ws2_edge_comparison(args))
         args.random_checkpoint = original_random_checkpoint
-        paths.append(make_figure_5(args))
         args.random_checkpoint = original_random_checkpoint
     else:
         paths = [args.func(args)]

@@ -920,6 +920,7 @@ def render_atom_image(
     sigmas: Optional[np.ndarray] = None,
     target_coordinates: Optional[np.ndarray] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    return_stages: bool = False,
 ) -> Dict[str, Any]:
     """Render coordinates and brightnesses into an image/target pair."""
 
@@ -945,11 +946,17 @@ def render_atom_image(
     render_shape = _expanded_shape(config.image_shape, padding)
     image = np.zeros(render_shape, dtype=np.float32)
     target = np.zeros(render_shape, dtype=np.float32)
+    stages: dict[str, np.ndarray] = {}
+
+    def capture(name: str) -> None:
+        if return_stages:
+            stages[name] = image.copy()
     render_coordinates = _shift_coordinates(coordinates, (padding, padding))
     for coord, amplitude, sigma in zip(render_coordinates, intensities, sigmas):
         _stamp_gaussian(image, coord, float(sigma), amplitude=float(amplitude), mode="sum")
     for coord in _shift_coordinates(target_coordinates, (padding, padding)):
         _stamp_gaussian(target, coord, float(config.target_sigma), amplitude=1.0, mode="max")
+    capture("atomic_contrast")
 
     image += _sample_scalar(rng, config.background_range)
     yy, xx = _make_coordinate_grids(render_shape)
@@ -963,18 +970,22 @@ def render_atom_image(
             config.inhomogeneous_background_sigma_fraction_range,
         )
         image += inhomogeneous_strength * _smooth_unit_field(rng, render_shape, sigma_fraction)
+    capture("background")
 
     low_freq_strength = _sample_scalar(rng, config.low_frequency_noise_range)
     if low_freq_strength > 0:
         low_freq_noise = rng.normal(0.0, low_freq_strength, size=render_shape).astype(np.float32)
         smooth_sigma = max(render_shape) * _sample_scalar(rng, config.low_frequency_sigma_fraction_range)
         image += gaussian_filter(low_freq_noise, sigma=smooth_sigma, mode="reflect")
+    capture("low_frequency_noise")
 
     blur_sigma = _sample_scalar(rng, config.blur_sigma_range)
     if blur_sigma > 0:
         image = gaussian_filter(image, sigma=blur_sigma, mode="reflect")
+    capture("blur")
     if config.normalize_input:
         image = _normalize(image)
+    capture("pre_poisson_normalized")
 
     if padding > 0:
         crop_y = slice(padding, padding + config.image_shape[0])
@@ -991,6 +1002,7 @@ def render_atom_image(
     else:
         count_map = rng.poisson(poisson_ready * count_scale).astype(np.float32)
         image = count_map / float(count_scale)
+    capture("poisson")
 
     read_noise = rng.normal(
         0.0,
@@ -998,7 +1010,9 @@ def render_atom_image(
         size=image.shape,
     ).astype(np.float32)
     image += read_noise
+    capture("read_noise")
     image = _normalize(image)
+    capture("final")
     if config.clamp_target:
         target = np.clip(target, 0.0, 1.0)
 
@@ -1016,6 +1030,15 @@ def render_atom_image(
     }
     if metadata:
         image_record.update(metadata)
+    if return_stages:
+        # Earlier stages include the off-frame support margin; return every
+        # stage in the same final image coordinates without consuming RNG.
+        image_record["stages"] = {
+            name: value[padding:padding + config.image_shape[0],
+                        padding:padding + config.image_shape[1]]
+            if value.shape != image.shape else value
+            for name, value in stages.items()
+        }
     return image_record
 
 
