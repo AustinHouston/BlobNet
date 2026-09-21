@@ -124,7 +124,32 @@ Dataset generation runs in parallel by default when it is needed; use `--dataset
 
 ## Experimental Images
 
-`notebooks/emd_reader.ipynb` is a self-contained pyTEMlib notebook for loading and plotting every EMD file in `experimental_data/`.
+The manuscript and SI generation scripts load the publication-ready HDF5 images in `experimental_data/`.
+
+## Reproduce the publication
+
+The repository includes the five publication-ready experimental images, the exact model checkpoints used by the figure workflow, their available training records, the locked Python environment, and the manuscript source. Figure 3 uses its separately packaged `figure3_random` and `figure3_hexagonal` checkpoints so that its published detections remain unchanged. All individual binary files are below GitHub's 100 MB limit.
+
+After cloning, install the locked environment and audit the publication inputs:
+
+```bash
+uv sync --frozen
+uv run blobnet-reproduce-publication --target audit
+```
+
+Regenerate the manuscript figures and compile the manuscript when `latexmk` is installed:
+
+```bash
+uv run blobnet-reproduce-publication --target manuscript --device auto --compile-latex
+```
+
+Regenerate the full SI, including the gold-in-TiO2 figure:
+
+```bash
+uv run blobnet-reproduce-publication --target si --device auto --compile-latex
+```
+
+Use `--target all` to run both workflows. Generated files are written under `outputs/`; manuscript figures are copied to `publication/manuscript/figures/` before LaTeX compilation. The packaged checkpoints provide deterministic figure inputs. The separate `blobnet-train-manuscript` command independently regenerates synthetic datasets and retrains the three primary models from the tracked YAML configurations; retrained floating-point weights can vary across hardware and software backends.
 
 ## Python API
 
@@ -148,7 +173,9 @@ scripts/
   train_unet.py
   check_mps.py
 notebooks/                   dataset and experimental-image exploration
-experimental_data/           tracked EMD examples
+experimental_data/           tracked publication-ready HDF5 images
+artifacts/manuscript_models/ exact publication checkpoints and training records
+publication/manuscript/      manuscript LaTeX, bibliography, captions, and sections
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions.

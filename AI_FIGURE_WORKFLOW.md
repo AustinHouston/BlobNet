@@ -11,7 +11,7 @@ not intended as a training guide.
 - `scripts/` contains command-line workflows. Most figure work lives in
   `scripts/make_manuscript_figures.py`.
 - `configs/` contains YAML configs for datasets and models.
-- `experimental_data/` contains the tracked experimental `.emd` files used for
+- `experimental_data/` contains the tracked experimental `.h5` files used for
   experimental HAADF figures.
 - `outputs/` contains generated datasets, checkpoints, measurements, sweeps, and
   figure outputs. Many subdirectories are ignored by git.
@@ -67,7 +67,7 @@ uv run blobnet-manuscript-figures figure3 --output-dir outputs/manuscript_figure
 
 ## Experimental Data Figures
 
-Experimental `.emd` inputs live in:
+Experimental `.h5` inputs live in:
 
 ```text
 experimental_data/
@@ -75,10 +75,11 @@ experimental_data/
 
 Current experimental files:
 
-- `WS2.emd`
-- `QuasiCrystal.emd`
-- `TwinBoundary.emd`
-- `TwinsOverview.emd`
+- `pristine_monolayer_MoS2.h5`
+- `Sigma3_coherent_twin_grain_boundary_FCC_Al.h5`
+- `high_angle_grain_boundary_monolayer_WS2.h5`
+- `Al72Ni11Co17_quasicrystal.h5`
+- `gold_implanted_in_TiO2.h5`
 
 Feature measurement summaries used for feature-size matching are expected at:
 
@@ -116,8 +117,8 @@ Poisson-noised variants.
 Important options for `figure3-localizations`:
 
 - `--checkpoint`: BlobNet checkpoint. Default:
-  `outputs/manuscript_models/random/unet_best.pth`.
-- `--data-dir`: experimental `.emd` directory. Default: `experimental_data`.
+  `artifacts/manuscript_models/figure3_random/unet_best.pth`.
+- `--data-dir`: experimental `.h5` directory. Default: `experimental_data`.
 - `--experimental-measurements`: feature measurement JSON path.
 - `--feature-match-sigma-px`: target feature sigma in pixels. Default: `2.9`.
 - `--experimental-crop-size`: output crop size. Default: `512`.
@@ -150,7 +151,7 @@ Helpful existing functions:
 - `_load_blobnet_model`: loads a U-Net checkpoint.
 - `_predict_array`: runs model inference on one image.
 - `_predict_tiled`: tiled inference for larger images.
-- `_load_experimental_image`: reads and normalizes an experimental `.emd` image.
+- `_load_experimental_image`: reads and normalizes an experimental `.h5` image.
 - `_make_feature_matched_experimental_view`: DoG background subtraction,
   feature-size matching, and center crop/pad used by Figure 3.
 - `_plot_clean_image`: simple image panel plotting.

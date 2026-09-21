@@ -31,6 +31,7 @@ blobnet-manuscript-figures = "scripts.make_manuscript_figures:main"
 blobnet-train-manuscript = "scripts.train_manuscript_models:main"
 blobnet-pixel-size-sweep = "scripts.run_pixel_size_sweep:main"
 blobnet-supplemental-figures = "scripts.make_supplemental_figures:main"
+blobnet-reproduce-publication = "scripts.reproduce_publication:main"
 
 [tool.uv.sources]
 torch = [
