@@ -1,0 +1,14 @@
+{
+  "device": "cuda",
+  "epochs_completed": 19,
+  "best_epoch": 19,
+  "best_validation_loss": 0.003832878021057695,
+  "final_training_loss": 0.0038144827049109153,
+  "final_validation_loss": 0.003832878021057695,
+  "test_loss": 0.003938809008104727,
+  "training_seconds": 470.08004879951477,
+  "train_samples": 1024,
+  "val_samples": 256,
+  "test_samples": 256,
+  "trainable_parameters": 1927841
+}

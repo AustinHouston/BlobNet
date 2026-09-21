@@ -12,7 +12,7 @@ dataset:
 parameters:
   image_shape: [512, 512]
   lattice_type: hexagonal
-  # Main experimental nearest-neighbor mode from WS2/TwinsOverview.
+  # Main experimental nearest-neighbor mode from the publication HDF5 images.
   lattice_spacing_range: [13.0, 18.0]
   rotation_range: [0.0, 180.0]
   jitter_std_range: [0.0, 0.25]

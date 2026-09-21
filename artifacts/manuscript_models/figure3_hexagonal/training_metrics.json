@@ -1,0 +1,14 @@
+{
+  "device": "mps",
+  "epochs_completed": 10,
+  "best_epoch": 10,
+  "best_validation_loss": 0.003790970687987283,
+  "final_training_loss": 0.0037995378024788806,
+  "final_validation_loss": 0.003790970687987283,
+  "test_loss": 0.0039390907586493995,
+  "training_seconds": 663.2209892272949,
+  "train_samples": 1024,
+  "val_samples": 256,
+  "test_samples": 256,
+  "trainable_parameters": 1927841
+}
