@@ -64,6 +64,9 @@ def _find_haadf_with_h5py(path: Path) -> np.ndarray:
 
 
 def load_experimental_image(path: Path) -> np.ndarray:
+    with h5py.File(path, 'r') as handle:
+        if 'image' in handle:
+            return _normalize_image(np.asarray(handle['image'], dtype=np.float32).squeeze())
     image = _find_haadf_with_pytemlib(path)
     if image is None:
         image = _find_haadf_with_h5py(path)
@@ -226,7 +229,7 @@ def write_diagnostic(summary: dict[str, Any], output_dir: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Measure blob feature sizes and spacing in experimental HAADF EMD images.')
+    parser = argparse.ArgumentParser(description='Measure blob feature sizes and spacing in experimental HAADF HDF5 images.')
     parser.add_argument('--data-dir', type=Path, default=Path('experimental_data'))
     parser.add_argument('--output-dir', type=Path, default=Path('outputs/experimental_feature_measurements'))
     parser.add_argument('--dog-small', type=float, default=0.8)
@@ -245,7 +248,7 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summaries = []
-    for path in sorted(args.data_dir.glob('*.emd')):
+    for path in sorted(args.data_dir.glob('*.h5')):
         summary = summarize_image(path, args)
         write_diagnostic(summary, args.output_dir)
         clean = {key: value for key, value in summary.items() if not key.startswith('_')}

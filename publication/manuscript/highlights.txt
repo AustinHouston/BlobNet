@@ -1,0 +1,6 @@
+Highlights
+
+• Blob-Net learns atomic contrast without a crystallographic training prior
+• Aperiodic training reduces false atom predictions at material boundaries
+• Blob-Net transfers across periodic, defective, and quasiperiodic structures
+• Feature size and receptive field determine pixel-scale transfer limits

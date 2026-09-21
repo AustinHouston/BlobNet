@@ -449,14 +449,11 @@ class Study:
         self.save(7,fig,output,'Controlled square-edge displacement sweep. Brightness, Gaussian width, vacancies (none), material geometry and noise seeds are fixed within each replicate; only the amplitude of the same displacement field changes. Solid/dashed regional recall separates a 30-pixel edge band from the interior. Common-subset RMSE uses the same ground-truth atoms successfully matched by every model. This intervention isolates displacement but does not reproduce every material-specific difference in main Figure 2.')
 
     def experimental(self):
-        files=['WS2.emd','TwinBoundary.emd','0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd','QuasiCrystal_4p60Mx_20260717.emd']
+        files=['pristine_monolayer_MoS2.h5','Sigma3_coherent_twin_grain_boundary_FCC_Al.h5','high_angle_grain_boundary_monolayer_WS2.h5','Al72Ni11Co17_quasicrystal.h5']
         result=[]
         for name in files:
             path=ROOT/'experimental_data'/name
-            if name.startswith('0063'):
-                raw,pixel,selection=mainfig._load_velox_displayed_haadf(path,512)
-            else:
-                raw=mainfig._load_experimental_image(path); pixel=mainfig._read_channel_pixel_size_nm(path); selection=None
+            raw=mainfig._load_experimental_image(path); pixel=mainfig._read_channel_pixel_size_nm(path); selection=None
             # This is an explicit SI protocol, equal for both networks; it is
             # deliberately not claimed to be an exact replay of all main panels.
             display,native,transform=mainfig._make_fixed_fov_resolution_view(raw,.8,8.,512,max(64,int(round(512*pixel/.025))))
@@ -954,7 +951,9 @@ def additional_panels(study):
 def write_document(study):
     doc=study.doc; completed=[]; sections=[]; writeup=[]
     for number in range(1,14):
+        if number == 2: continue  # Omitted from the SI at author request.
         paths=sorted((study.out/'data').glob(f'fig-S{number:02d}*.json'), key=lambda p: (len(p.stem),p.stem))
+        if number in (4, 5, 8): paths = paths[:1]
         if not paths: continue
         completed.append(number)
         primary=json.loads(paths[0].read_text())
@@ -972,6 +971,7 @@ def write_document(study):
             # the next sheet starts on a new page.
             sections.append(r'\clearpage'+'\n')
             if j==0:
+                sections.append(r'\setcounter{section}{'+str(number-1)+'}\n')
                 sections.append(r'\section{'+latex_escape(TITLES[number])+'}\n')
             sections.append(r'\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{'+stem+'.pdf}}\n')
             sections.append(r'\begingroup\captionsetup{type=figure}'+'\n')
@@ -1010,7 +1010,7 @@ Model & Epochs & Best epoch & Validation loss & Parameters\\\hline
 All three archived models use filter widths [32, 64, 128, 256], bottleneck dropout 0.2, Adam learning rate 0.001 and batch size 32. The maximum is 20 epochs, with patience six and minimum improvement 0.0005 for the stopping counter. A checkpoint is saved on any new validation minimum. The loss combines equal weights of global MSE and peak-weighted MSE (target threshold 0.1; peak weight multiplier 5). Their combined effect is a weight of three on peak pixels relative to one elsewhere, averaged over all pixels.
 
 \section*{Experimental interpretation and limits}
-Experimental comparisons report detector agreement and sensitivity, not independently measured accuracy. No manual annotations were supplied or invented. The source designated WS2.emd conflicts with the first experimental material designation in the manuscript; composition requires author verification. This supplement uses source-file labels until that is resolved. Neither absence of visible missed columns nor inter-model agreement establishes perfect detection.
+Experimental comparisons report detector agreement and sensitivity, not independently measured accuracy. No manual annotations were supplied or invented. Neither absence of visible missed columns nor inter-model agreement establishes perfect detection.
 
 The bottleneck receptive field is 68 pixels. Decoder operations enlarge output support; the bottleneck value alone does not bound all output dependence. Context interventions and synthetic scale sweeps characterize specified tests and do not establish that the model is free from all dataset priors.
 '''
@@ -1037,6 +1037,7 @@ The bottleneck receptive field is 68 pixels. Decoder operations enlarge output s
 \maketitle
 \input{sections/methods}
 \input{sections/supplementary_figures}
+\IfFileExists{sections/utkarsh_gold_tio2.tex}{\input{sections/utkarsh_gold_tio2}}{}
 \input{sections/tables}
 \end{document}
 '''
@@ -1055,7 +1056,7 @@ The bottleneck receptive field is 68 pixels. Decoder operations enlarge output s
     shutil.copy2(Path(__file__),doc/'make_supplemental_figures.py')
     source=doc/'source_data'; source.mkdir(exist_ok=True)
     for p in (study.out/'data').glob('*.json'): shutil.copy2(p,source/p.name)
-    (doc/'README.md').write_text('# Blob-Net SI\n\nStandalone LaTeX companion matching the main manuscript typography and authors.\n\nFrom the BlobNet code repository:\n\n```sh\n.venv/bin/python -m scripts.make_supplemental_figures --figure all --device mps\n```\n\nUse `--figure 1` through `--figure 13` for one experiment, or `--figure document` to rebuild the document. Outputs default to `outputs/supplemental_information_20260913`, with the document written to `~/Desktop/Projects/BlobNet_SI`. `--output-dir` and `--document-dir` override these. Numerical data and caches are isolated; original manuscript figures and models are read-only. The copied script is a source snapshot; run it as a module from the BlobNet repository so package imports resolve.\n\nBuild the document with:\n\n```sh\nlatexmk -pdf -interaction=nonstopmode -halt-on-error supplementary_information.tex\n```\n\nSee SI_writeup.md for the short figure descriptions and scientific limitations. Full checkpoint and configuration hashes are in run_manifest.json; per-figure measurements are in source_data/. Training histories for new runs are in Figure S12 source data.\n')
+    (doc/'README.md').write_text('# Blob-Net SI\n\nStandalone LaTeX companion matching the main manuscript typography and authors.\n\nFrom the BlobNet code repository, run `uv run blobnet-reproduce-publication --target si --device auto --compile-latex`. Generated numerical data, figures, source snapshots, and the assembled document remain under `outputs/supplemental_information_20260913`.\n')
     print('Document updated:',doc,flush=True)
 
 
@@ -1064,8 +1065,8 @@ def parse_args():
     parser.add_argument('--start-at',type=int,default=1,choices=range(1,14),help='First figure when running all; earlier cached results remain available.')
     parser.add_argument('--figure',default='all',choices=['all','document']+[str(i) for i in range(1,14)])
     parser.add_argument('--output-dir',type=Path,default=ROOT/'outputs/supplemental_information_20260913')
-    parser.add_argument('--document-dir',type=Path,default=Path.home()/'Desktop/Projects/BlobNet_SI')
-    parser.add_argument('--model-dir',type=Path,default=Path.home()/'Desktop/manuscript_models')
+    parser.add_argument('--document-dir',type=Path,default=ROOT/'outputs/supplemental_information_20260913/document')
+    parser.add_argument('--model-dir',type=Path,default=ROOT/'artifacts/manuscript_models')
     parser.add_argument('--device',choices=['auto','cpu','mps','cuda'],default='auto')
     parser.add_argument('--samples',type=int,default=256)
     parser.add_argument('--validation-samples',type=int,default=8)
@@ -1085,7 +1086,8 @@ def parse_args():
 
 def main():
     args=parse_args(); study=Study(args)
-    numbers=range(args.start_at,14) if args.figure=='all' else [] if args.figure=='document' else [int(args.figure)]
+    numbers=([number for number in range(args.start_at,14) if number != 2]
+             if args.figure=='all' else [] if args.figure=='document' else [int(args.figure)])
     for number in numbers:
         print(f'Starting S{number}: {TITLES[number]}',flush=True)
         getattr(study,f's{number}')()

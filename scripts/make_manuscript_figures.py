@@ -278,6 +278,9 @@ def _find_haadf_with_h5py(path: Path) -> np.ndarray:
 
 
 def _load_experimental_image(path: Path) -> np.ndarray:
+    with h5py.File(path, 'r') as handle:
+        if 'image' in handle:
+            return _normalize_image(np.asarray(handle['image'], dtype=np.float32).squeeze())
     image = _find_haadf_with_pytemlib(path)
     if image is None:
         image = _find_haadf_with_h5py(path)
@@ -298,6 +301,16 @@ def _decode_velox_json(dataset: h5py.Dataset, index: int = 0) -> dict[str, Any]:
 def _load_velox_displayed_haadf(path: Path, crop_size: int) -> tuple[np.ndarray, float, dict[str, Any]]:
     """Read the final displayed DCFI(HAADF), or HAADF fallback, from a Velox EMD."""
     with h5py.File(path, 'r') as handle:
+        if 'image' in handle and 'pixel_size_nm' in handle['image'].attrs:
+            full_image = np.asarray(handle['image'], dtype=np.float32).squeeze()
+            image = _center_crop_or_pad(full_image, int(crop_size))
+            return _normalize_image(image), float(handle['image'].attrs['pixel_size_nm']), {
+                'display_label': str(handle.attrs.get('source_display_label', 'HAADF')),
+                'data_path': '/image',
+                'series_index': int(handle.attrs.get('source_series_index', 0)),
+                'source_shape': list(full_image.shape),
+                'selection': str(handle.attrs.get('selection', '')),
+            }
         displays = handle.get('Presentation/Displays/ImageDisplay')
         if displays is None:
             raise ValueError(f'No Velox image displays found in {path}.')
@@ -355,6 +368,10 @@ def _load_velox_displayed_haadf(path: Path, crop_size: int) -> tuple[np.ndarray,
 
 
 def _read_channel_pixel_size_nm(path: Path, channel: str = 'Channel_000') -> float:
+    with h5py.File(path, 'r') as handle:
+        if 'image' in handle and 'pixel_size_nm' in handle['image'].attrs:
+            return float(handle['image'].attrs['pixel_size_nm'])
+
     import pyTEMlib.file_tools as ft
 
     def read_pixel_size(dataset: Any) -> float:
@@ -728,8 +745,16 @@ def make_figure_3(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
     model = _load_blobnet_model(args.checkpoint, device, args.num_filters, args.dropout)
-    hex_checkpoint = getattr(args, 'hexagonal_checkpoint',
-                             Path(__file__).resolve().parents[1] / 'outputs/manuscript_models/hexagonal/unet_best.pth')
+    hex_checkpoint = getattr(
+        args,
+        'figure3_hexagonal_checkpoint',
+        getattr(
+            args,
+            'hexagonal_checkpoint',
+            Path(__file__).resolve().parents[1]
+            / 'artifacts/manuscript_models/figure3_hexagonal/unet_best.pth',
+        ),
+    )
     hex_model = _load_blobnet_model(hex_checkpoint, device, args.num_filters, args.dropout)
     match_radius_nm = getattr(args, 'agreement_radius_nm', 0.06)
     category_colors = {
@@ -740,11 +765,11 @@ def make_figure_3(args: argparse.Namespace) -> Path:
 
     fourth_image = getattr(
         args, 'fourth_image',
-        args.data_dir / '0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+        args.data_dir / 'high_angle_grain_boundary_monolayer_WS2.h5',
     )
     files = [
-        ('WS$_2$', args.data_dir / 'WS2.emd'),
-        ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
+        ('MoS$_2$', args.data_dir / 'pristine_monolayer_MoS2.h5'),
+        ('Twin boundary', args.data_dir / 'Sigma3_coherent_twin_grain_boundary_FCC_Al.h5'),
         ('WS$_2$ (0063)', fourth_image),
         ('Quasicrystal', args.quasicrystal_image),
     ]
@@ -789,7 +814,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
             display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
             display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
         hexagonal_pixel_size_factor = (
-            float(args.ws2_hexagonal_pixel_size_factor) if path.name == 'WS2.emd' else 1.0
+            float(args.ws2_hexagonal_pixel_size_factor) if path.name == 'pristine_monolayer_MoS2.h5' else 1.0
         )
         hexagonal_target_pixel_size_nm = float(args.target_pixel_size_nm) * hexagonal_pixel_size_factor
         hexagonal_native_pixels = max(1, int(round(field_of_view_nm / hexagonal_target_pixel_size_nm)))
@@ -804,7 +829,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
         )
         hexagonal_threshold_rel = (
             float(args.ws2_hexagonal_threshold_rel)
-            if path.name == 'WS2.emd' else float(args.localization_threshold_rel)
+            if path.name == 'pristine_monolayer_MoS2.h5' else float(args.localization_threshold_rel)
         )
         hex_coordinates = np.asarray(extract_subpixel_peak_positions(
             hex_prediction, threshold_rel=hexagonal_threshold_rel,
@@ -829,7 +854,11 @@ def make_figure_3(args: argparse.Namespace) -> Path:
             'shared_marker_position': 'Pair midpoint; agreement is not ground-truth correctness.',
             'counts': {key: len(value) for key, value in groups.items()},
             'category_colors': category_colors,
-            'category_markers': {'Both': 'open circle', 'Hex-Net only': 'x', 'Blob-Net only': 'x'},
+            'category_markers': {
+                'Both': 'open circle',
+                'Hex-Net only': getattr(args, 'disagreement_marker', 'x'),
+                'Blob-Net only': getattr(args, 'disagreement_marker', 'x'),
+            },
             'pairs_blob_hex_indices': pairs.tolist(),
             'pair_distances_nm': matching['distances_nm'].tolist(),
             'category_coordinates_yx_display_pixels': {key: value.tolist() for key, value in groups.items()},
@@ -867,14 +896,20 @@ def make_figure_3(args: argparse.Namespace) -> Path:
     for col, ((label, image, _transform), groups) in enumerate(zip(images, category_coordinates)):
         _plot_clean_image(axes[0, col], image, label, cmap='gray')
         _plot_clean_image(axes[1, col], image, '', cmap='gray')
+        disagreement_marker = getattr(args, 'disagreement_marker', 'x')
         for category, atom_coordinates in groups.items():
             if len(atom_coordinates):
-                style = (
-                    {'marker': 'o', 'facecolors': 'none', 'edgecolors': category_colors[category]}
-                    if category == 'Both' else {'marker': 'x', 'color': category_colors[category]}
-                )
+                if category == 'Both':
+                    style = {'marker': 'o', 'facecolors': 'none', 'edgecolors': category_colors[category]}
+                elif disagreement_marker == 's':
+                    style = {'marker': 's', 'facecolors': 'none', 'edgecolors': category_colors[category]}
+                else:
+                    style = {'marker': disagreement_marker, 'color': category_colors[category]}
+                marker_size = args.marker_size
+                if category != 'Both':
+                    marker_size *= getattr(args, 'disagreement_marker_size_scale', 1.2)
                 axes[1, col].scatter(
-                    atom_coordinates[:, 1], atom_coordinates[:, 0], s=args.marker_size,
+                    atom_coordinates[:, 1], atom_coordinates[:, 0], s=marker_size,
                     linewidths=args.marker_linewidth, alpha=0.96, **style,
                 )
         for row in range(2):
@@ -887,12 +922,14 @@ def make_figure_3(args: argparse.Namespace) -> Path:
             )
 
     fig.legend(
-        handles=[Line2D([0], [0], linestyle='none', marker='o' if category == 'Both' else 'x',
+        handles=[Line2D([0], [0], linestyle='none',
+                        marker='o' if category == 'Both' else disagreement_marker,
                         markerfacecolor='none', markeredgecolor=color, markeredgewidth=args.marker_linewidth,
-                        markersize=8, label=category) for category, color in category_colors.items()],
+                        markersize=8 if category == 'Both' else 8.8,
+                        label=category) for category, color in category_colors.items()],
         loc='upper center', bbox_to_anchor=(0.5, 1.065), ncol=3, frameon=False, fontsize=AXIS_LABEL_SIZE,
     )
-    output_path = output_dir / 'figure3_experimental_haadf_outputs.png'
+    output_path = output_dir / getattr(args, 'output_name', 'figure3_experimental_haadf_outputs.png')
     fig.savefig(output_path, dpi=args.dpi, bbox_inches='tight')
     if args.save_pdf:
         figure_pdf_path = output_dir / 'figure3_experimental_haadf_outputs.pdf'
@@ -978,9 +1015,9 @@ def make_figure_3b(args: argparse.Namespace) -> Path:
         ),
     ]
     files = [
-        ('WS$_2$', args.data_dir / 'WS2.emd'),
+        ('MoS$_2$', args.data_dir / 'pristine_monolayer_MoS2.h5'),
         ('Quasicrystal', args.quasicrystal_image),
-        ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
+        ('Twin boundary', args.data_dir / 'Sigma3_coherent_twin_grain_boundary_FCC_Al.h5'),
     ]
 
     images: list[tuple[str, np.ndarray, np.ndarray, dict[str, Any]]] = []
@@ -1111,7 +1148,7 @@ def make_figure_3b(args: argparse.Namespace) -> Path:
 
 
 def make_figure_3c(args: argparse.Namespace) -> Path:
-    """Run the Figure 3b comparison on four displayed multi-frame Velox HAADF images."""
+    """Run the Figure 3b comparison on displayed multi-frame Velox HAADF images."""
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _device_from_name(args.device)
@@ -1152,7 +1189,10 @@ def make_figure_3c(args: argparse.Namespace) -> Path:
                 'velox_selection': velox_selection,
             }
         )
-        images.append((path.name.split(' - ')[0], display_view, native_view, transform))
+        label = path.name.split(' - ')[0]
+        np.savez_compressed(output_dir / f'{label}_processed_inputs.npz', display=display_view, inference=native_view)
+        transform['effective_inference_pixel_size_nm'] = source_pixel_size_nm * (display_view.shape[0] - 1) / max(native_pixels - 1, 1)
+        images.append((label, display_view, native_view, transform))
 
     model_coordinates: dict[str, list[np.ndarray]] = {}
     model_records: dict[str, list[dict[str, Any]]] = {}
@@ -1178,6 +1218,7 @@ def make_figure_3c(args: argparse.Namespace) -> Path:
             if len(display_coordinates):
                 display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
                 display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
+            np.savez_compressed(output_dir / f'{_label}_{model_label.replace(" ", "_")}_predictions.npz', prediction=native_prediction, coordinates_yx_inference=native_coordinates, coordinates_yx_display=display_coordinates, coordinates_yx_nm=display_coordinates * transform['source_pixel_size_nm'])
             coordinates_for_model.append(display_coordinates)
             records_for_model.append(
                 {
@@ -1190,7 +1231,7 @@ def make_figure_3c(args: argparse.Namespace) -> Path:
         model_coordinates[model_label] = coordinates_for_model
         model_records[model_label] = records_for_model
 
-    fig, axes = plt.subplots(3, len(images), figsize=(15.8, 10.8), constrained_layout=True)
+    fig, axes = plt.subplots(3, len(images), figsize=(3.95 * len(images), 10.8), constrained_layout=True, squeeze=False)
     for col, (label, image, _native_view, transform) in enumerate(images):
         _plot_clean_image(axes[0, col], image, label, cmap='gray')
         _add_physical_scale_bar(
@@ -3220,7 +3261,7 @@ def make_figure3_pixel_size_sweep(args: argparse.Namespace) -> Path:
 
     summary = {
         'images': [str(path) for path in args.images],
-        'image_order': ['WS2', 'Quasicrystal', 'Twin boundary'],
+        'image_order': ['Pristine monolayer MoS2', 'Al72Ni11Co17 quasicrystal', 'Sigma3 coherent twin grain boundary in FCC-Al'],
         'source_pixel_sizes_nm': source_pixel_sizes_nm,
         'field_of_views_nm': field_of_views_nm,
         'base_pixel_size_nm': float(args.base_pixel_size_nm),
@@ -3235,10 +3276,9 @@ def make_figure3_pixel_size_sweep(args: argparse.Namespace) -> Path:
 
 def _experimental_figure_files(args: argparse.Namespace) -> list[tuple[str, Path]]:
     return [
-        ('WS2 grain boundary', args.data_dir / 'WS2.emd'),
-        ('Quasicrystal', args.data_dir / 'QuasiCrystal.emd'),
-        ('Twin boundary', args.data_dir / 'TwinBoundary.emd'),
-        ('Twins overview', args.data_dir / 'TwinsOverview.emd'),
+        ('WS2 grain boundary', args.data_dir / 'high_angle_grain_boundary_monolayer_WS2.h5'),
+        ('Quasicrystal', args.data_dir / 'Al72Ni11Co17_quasicrystal.h5'),
+        ('Twin boundary', args.data_dir / 'Sigma3_coherent_twin_grain_boundary_FCC_Al.h5'),
     ]
 
 
@@ -4141,10 +4181,14 @@ def make_figure_2(args: argparse.Namespace) -> Path:
     ]
 
     with_offsets = getattr(args, 'with_offset_diagnostics', False)
-    fig = plt.figure(figsize=(32.0 if with_offsets else 20.0, 11.4), constrained_layout=True)
-    grid = fig.add_gridspec(len(cases), 8 if with_offsets else 5,
-                            width_ratios=[1.05] + [1.0] * (7 if with_offsets else 4),
-                            wspace=0.05, hspace=0.05)
+    if with_offsets:
+        fig = plt.figure(figsize=(19, 8.8))
+        grid = fig.add_gridspec(len(cases), 8, left=0.035, right=0.99, top=0.985,
+                                bottom=0.075, wspace=0.17, hspace=0.28)
+    else:
+        fig = plt.figure(figsize=(20.0, 11.4), constrained_layout=True)
+        grid = fig.add_gridspec(len(cases), 5, width_ratios=[1.05] + [1.0] * 4,
+                                wspace=0.05, hspace=0.05)
     summary: dict[str, Any] = {
         'output_path': str(output_dir / 'figure2_edge_lattice_model_diagnostics.png'),
         'seed': int(args.seed),
@@ -4215,15 +4259,22 @@ def make_figure_2(args: argparse.Namespace) -> Path:
                 offsets = (classes['matched_predicted'] - classes['true_positives'])[:, ::-1]
                 ax = fig.add_subplot(grid[row, column])
                 if len(offsets):
-                    # Single-example histograms produce isolated black one-count
-                    # bins beneath the points. Show all offsets directly in the
-                    # same model colors as Figure 1, without that raster layer.
+                    hist, x_edges, y_edges = np.histogram2d(
+                        offsets[:, 0], offsets[:, 1], bins=args.offset_bins,
+                        range=[[-args.offset_range, args.offset_range],
+                               [-args.offset_range, args.offset_range]],
+                    )
+                    ax.imshow(hist.T, extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
+                              origin='lower', cmap='magma',
+                              norm=LogNorm(vmin=1, vmax=max(float(hist.max()), 1.0)))
                     ax.scatter(offsets[:, 0], offsets[:, 1], s=3, c=MODEL_COLORS[spec.key],
                                alpha=0.35, linewidths=0)
                 ax.axhline(0, color='white', linewidth=0.7, alpha=0.65)
                 ax.axvline(0, color='white', linewidth=0.7, alpha=0.65)
-                ax.set(xlim=(-2, 2), ylim=(-2, 2), aspect='equal', facecolor='#17121f',
+                ax.set(xlim=(-args.offset_range, args.offset_range),
+                       ylim=(-args.offset_range, args.offset_range), aspect='equal', facecolor='#17121f',
                        xticks=[-1, 0, 1], yticks=[-1, 0, 1])
+                ax.tick_params(labelsize=AXIS_TICK_SIZE)
                 metrics = _localization_metric_summary(classes)
                 rmse_label = 'N/A' if metrics['rmse'] is None else f"{metrics['rmse']:.2f}px"
                 ax.text(0.04, 0.96, f"F1={metrics['f1']:.3f}\nRMSE={rmse_label}",
@@ -4535,9 +4586,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_arguments(figure1)
     _add_model_arguments(figure1)
     _add_dataset_config_arguments(figure1)
-    figure1.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
-    figure1.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    figure1.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure1.add_argument('--square-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/square/unet_best.pth')
+    figure1.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth')
+    figure1.add_argument('--random-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth')
     figure1.add_argument('--seed', type=int, default=0)
     figure1.add_argument('--offset-samples', type=int, default=32)
     figure1.add_argument('--batch-size', type=int, default=4)
@@ -4553,7 +4604,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3.add_argument(
         '--checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/figure3_random/unet_best.pth',
     )
     figure3.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     figure3.add_argument('--tile-size', type=int, default=256)
@@ -4567,12 +4618,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3.add_argument(
         '--quasicrystal-image',
         type=Path,
-        default=repo_root / 'experimental_data/QuasiCrystal_4p60Mx_20260717.emd',
+        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.h5',
     )
     figure3.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
     figure3.add_argument(
         '--fourth-image', type=Path,
-        default=repo_root / 'experimental_data/0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+        default=repo_root / 'experimental_data/high_angle_grain_boundary_monolayer_WS2.h5',
     )
     figure3.add_argument('--localization-threshold-rel', type=float, default=0.35)
     figure3.add_argument('--peak-min-distance', type=int, default=3)
@@ -4582,7 +4633,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3.add_argument('--marker-color', default='#D55E00')
     figure3.add_argument('--marker-edge-color', default='white')
     figure3.add_argument('--hexagonal-checkpoint', type=Path,
-                         default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
+                         default=repo_root / 'artifacts/manuscript_models/figure3_hexagonal/unet_best.pth')
     figure3.add_argument(
         '--ws2-hexagonal-pixel-size-factor', type=float, default=0.70,
         help='Hex-Net pixel-size factor for the first-column WS2 image; Blob-Net remains at 1.0.',
@@ -4592,6 +4643,9 @@ def build_parser() -> argparse.ArgumentParser:
         help='Hex-Net localization cutoff for the first-column WS2 image.',
     )
     figure3.add_argument('--save-pdf', action='store_true')
+    figure3.add_argument('--disagreement-marker', choices=['x', '+', 's'], default='+')
+    figure3.add_argument('--disagreement-marker-size-scale', type=float, default=1.2)
+    figure3.add_argument('--output-name', default='figure3_experimental_haadf_outputs.png')
     figure3.add_argument('--agreement-radius-nm', type=float, default=0.06)
     figure3.add_argument('--both-color', default=MODEL_COLORS['random'])
     figure3.add_argument('--hex-only-color', default=MODEL_COLORS['hexagonal'])
@@ -4609,12 +4663,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3b.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3b.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3b.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     figure3b.add_argument('--tile-size', type=int, default=256)
@@ -4626,7 +4680,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3b.add_argument(
         '--quasicrystal-image',
         type=Path,
-        default=repo_root / 'experimental_data/QuasiCrystal_4p60Mx_20260717.emd',
+        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.h5',
     )
     figure3b.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
     figure3b.add_argument('--localization-threshold-rel', type=float, default=0.35)
@@ -4643,21 +4697,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     figure3c = subparsers.add_parser(
         'figure3c',
-        help='Figure 3b-style comparison for four multi-frame Velox HAADF images.',
+        help='Figure 3b-style comparison for multi-frame Velox HAADF images.',
     )
     _add_shared_arguments(figure3c)
     _add_model_arguments(figure3c)
     figure3c.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
-    figure3c.add_argument('--images', type=Path, nargs=4, required=True)
+    figure3c.add_argument('--images', type=Path, nargs='+', required=True)
     figure3c.add_argument('--tile-size', type=int, default=256)
     figure3c.add_argument('--tile-overlap', type=int, default=64)
     figure3c.add_argument('--batch-size', type=int, default=4)
@@ -4686,12 +4740,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_cutoffs.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_cutoffs.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3c_cutoffs.add_argument('--image', type=Path, required=True)
     figure3c_cutoffs.add_argument('--tile-size', type=int, default=256)
@@ -4724,17 +4778,17 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_agreement_cutoffs.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_agreement_cutoffs.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3c_agreement_cutoffs.add_argument(
         '--image',
         type=Path,
-        default=repo_root / 'experimental_data/0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+        default=repo_root / 'experimental_data/high_angle_grain_boundary_monolayer_WS2.h5',
     )
     figure3c_agreement_cutoffs.add_argument(
         '--standard-emd', action='store_true',
@@ -4778,15 +4832,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(figure3c_normalization)
     figure3c_normalization.add_argument(
         '--blobnet-checkpoint', type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_normalization.add_argument(
         '--hexagonal-checkpoint', type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3c_normalization.add_argument(
         '--image', type=Path,
-        default=repo_root / 'experimental_data/0063 - 20250218 4.30 Mx STEM HAADF Diffraction 23.2 nm.emd',
+        default=repo_root / 'experimental_data/high_angle_grain_boundary_monolayer_WS2.h5',
     )
     figure3c_normalization.add_argument('--tile-size', type=int, default=256)
     figure3c_normalization.add_argument('--tile-overlap', type=int, default=64)
@@ -4826,12 +4880,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_pixel_sizes.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_pixel_sizes.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3c_pixel_sizes.add_argument('--image', type=Path, required=True)
     figure3c_pixel_sizes.add_argument(
@@ -4882,10 +4936,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(ws2_edge_hex_grid)
     ws2_edge_hex_grid.add_argument(
         '--hexagonal-checkpoint', type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     ws2_edge_hex_grid.add_argument(
-        '--image', type=Path, default=repo_root / 'experimental_data/WS2.emd',
+        '--image', type=Path, default=repo_root / 'experimental_data/pristine_monolayer_MoS2.h5',
     )
     ws2_edge_hex_grid.add_argument('--tile-size', type=int, default=256)
     ws2_edge_hex_grid.add_argument('--tile-overlap', type=int, default=64)
@@ -4919,12 +4973,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_fov_sweep.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_fov_sweep.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3c_fov_sweep.add_argument('--image', type=Path, required=True)
     figure3c_fov_sweep.add_argument('--crop-sizes', type=int, nargs='+', default=[512, 1024, 2048])
@@ -4955,12 +5009,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_region_atlas.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_region_atlas.add_argument(
         '--hexagonal-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth',
     )
     figure3c_region_atlas.add_argument('--image', type=Path, required=True)
     figure3c_region_atlas.add_argument('--grid-size', type=int, default=4)
@@ -4993,7 +5047,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_sqrt_input.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_sqrt_input.add_argument('--image', type=Path, required=True)
     figure3c_sqrt_input.add_argument('--tile-size', type=int, default=256)
@@ -5023,7 +5077,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3c_low_cutoffs.add_argument(
         '--blobnet-checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3c_low_cutoffs.add_argument('--image', type=Path, required=True)
     figure3c_low_cutoffs.add_argument('--tile-size', type=int, default=256)
@@ -5055,9 +5109,9 @@ def build_parser() -> argparse.ArgumentParser:
     quasicrystal_sweep.add_argument(
         '--checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
-    quasicrystal_sweep.add_argument('--image', type=Path, default=repo_root / 'experimental_data/QuasiCrystal.emd')
+    quasicrystal_sweep.add_argument('--image', type=Path, default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.h5')
     quasicrystal_sweep.add_argument('--tile-size', type=int, default=256)
     quasicrystal_sweep.add_argument('--tile-overlap', type=int, default=64)
     quasicrystal_sweep.add_argument('--batch-size', type=int, default=4)
@@ -5081,7 +5135,7 @@ def build_parser() -> argparse.ArgumentParser:
     common_pixel_size.add_argument(
         '--checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     common_pixel_size.add_argument('--images', type=Path, nargs=3, required=True)
     common_pixel_size.add_argument('--target-pixel-size-nm', type=float)
@@ -5102,7 +5156,7 @@ def build_parser() -> argparse.ArgumentParser:
     figure3_pixel_sweep.add_argument(
         '--checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth',
     )
     figure3_pixel_sweep.add_argument('--images', type=Path, nargs=3, required=True)
     figure3_pixel_sweep.add_argument('--base-pixel-size-nm', type=float, required=True)
@@ -5123,7 +5177,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_shared_arguments(figure3_localizations)
     _add_model_arguments(figure3_localizations)
-    figure3_localizations.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure3_localizations.add_argument('--checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth')
     figure3_localizations.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     figure3_localizations.add_argument('--tile-size', type=int, default=256)
     figure3_localizations.add_argument('--tile-overlap', type=int, default=64)
@@ -5149,7 +5203,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_arguments(figure4)
     _add_model_arguments(figure4)
     _add_feature_size_arguments(figure4)
-    figure4.add_argument('--checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure4.add_argument('--checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth')
     figure4.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
     figure4.add_argument('--sweep-dataset-config', type=Path)
     figure4.add_argument('--sweep-samples', type=int, default=64)
@@ -5163,9 +5217,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_arguments(ws2_edge_comparison)
     _add_model_arguments(ws2_edge_comparison)
     _add_feature_size_arguments(ws2_edge_comparison)
-    ws2_edge_comparison.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
-    ws2_edge_comparison.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    ws2_edge_comparison.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random_dense/unet_best.pth')
+    ws2_edge_comparison.add_argument('--square-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/square/unet_best.pth')
+    ws2_edge_comparison.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth')
+    ws2_edge_comparison.add_argument('--random-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random_dense/unet_best.pth')
     ws2_edge_comparison.add_argument('--seed', type=int, default=41)
     _add_edge_localization_arguments(ws2_edge_comparison)
     ws2_edge_comparison.set_defaults(func=make_ws2_edge_comparison)
@@ -5174,11 +5228,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_arguments(figure2)
     _add_model_arguments(figure2)
     _add_feature_size_arguments(figure2)
-    figure2.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
-    figure2.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    figure2.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
+    figure2.add_argument('--square-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/square/unet_best.pth')
+    figure2.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth')
+    figure2.add_argument('--random-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth')
     figure2.add_argument('--seed', type=int, default=41)
     figure2.add_argument('--with-offset-diagnostics', action='store_true')
+    figure2.add_argument('--offset-range', type=float, default=2.0)
+    figure2.add_argument('--offset-bins', type=int, default=48)
     _add_edge_localization_arguments(figure2)
     figure2.set_defaults(func=make_figure_2, feature_sigma_min=1.15, feature_sigma_max=2.65)
 
@@ -5187,14 +5243,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_arguments(all_parser)
     _add_dataset_config_arguments(all_parser)
     _add_feature_size_arguments(all_parser)
-    all_parser.add_argument('--square-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/square/unet_best.pth')
-    all_parser.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/hexagonal/unet_best.pth')
-    all_parser.add_argument('--random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random/unet_best.pth')
-    all_parser.add_argument('--ws2-random-checkpoint', type=Path, default=repo_root / 'outputs/manuscript_models/random_dense/unet_best.pth')
+    all_parser.add_argument('--square-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/square/unet_best.pth')
+    all_parser.add_argument('--hexagonal-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/hexagonal/unet_best.pth')
+    all_parser.add_argument('--random-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random/unet_best.pth')
+    all_parser.add_argument('--ws2-random-checkpoint', type=Path, default=repo_root / 'artifacts/manuscript_models/random_dense/unet_best.pth')
     all_parser.add_argument(
         '--checkpoint',
         type=Path,
-        default=repo_root / 'outputs/inhom_background_unet_20epoch/unet/unet_best.pth',
+        default=repo_root / 'artifacts/manuscript_models/figure3_random/unet_best.pth',
+    )
+    all_parser.add_argument(
+        '--figure3-hexagonal-checkpoint',
+        type=Path,
+        default=repo_root / 'artifacts/manuscript_models/figure3_hexagonal/unet_best.pth',
     )
     all_parser.add_argument('--data-dir', type=Path, default=repo_root / 'experimental_data')
     all_parser.add_argument('--sweep-csv', type=Path, default=repo_root / 'outputs/blobnet_pixel_size_sweep_random_4x/pixel_size_metrics.csv')
@@ -5220,13 +5281,17 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument(
         '--quasicrystal-image',
         type=Path,
-        default=repo_root / 'experimental_data/QuasiCrystal_4p60Mx_20260717.emd',
+        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.h5',
     )
     all_parser.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
+    all_parser.add_argument('--ws2-hexagonal-pixel-size-factor', type=float, default=0.70)
+    all_parser.add_argument('--ws2-hexagonal-threshold-rel', type=float, default=0.30)
     all_parser.add_argument('--marker-size', type=float, default=40.0)
     all_parser.add_argument('--marker-linewidth', type=float, default=0.2)
     all_parser.add_argument('--marker-color', default='#D55E00')
     all_parser.add_argument('--marker-edge-color', default='white')
+    all_parser.add_argument('--disagreement-marker', choices=['x', '+', 's'], default='+')
+    all_parser.add_argument('--disagreement-marker-size-scale', type=float, default=1.2)
     all_parser.add_argument('--scale-bar-length-nm', type=float, default=1.0)
     all_parser.add_argument('--scale-bar-linewidth', type=float, default=4.0)
     _add_edge_localization_arguments(all_parser)
