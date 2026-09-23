@@ -4182,9 +4182,9 @@ def make_figure_2(args: argparse.Namespace) -> Path:
 
     with_offsets = getattr(args, 'with_offset_diagnostics', False)
     if with_offsets:
-        fig = plt.figure(figsize=(19, 8.8))
-        grid = fig.add_gridspec(len(cases), 8, left=0.035, right=0.99, top=0.985,
-                                bottom=0.075, wspace=0.17, hspace=0.28)
+        fig = plt.figure(figsize=(27, 8.8))
+        grid = fig.add_gridspec(len(cases), 8, left=0.025, right=0.99, top=0.985,
+                                bottom=0.075, wspace=0.38, hspace=0.28)
     else:
         fig = plt.figure(figsize=(20.0, 11.4), constrained_layout=True)
         grid = fig.add_gridspec(len(cases), 5, width_ratios=[1.05] + [1.0] * 4,
@@ -4259,16 +4259,11 @@ def make_figure_2(args: argparse.Namespace) -> Path:
                 offsets = (classes['matched_predicted'] - classes['true_positives'])[:, ::-1]
                 ax = fig.add_subplot(grid[row, column])
                 if len(offsets):
-                    hist, x_edges, y_edges = np.histogram2d(
-                        offsets[:, 0], offsets[:, 1], bins=args.offset_bins,
-                        range=[[-args.offset_range, args.offset_range],
-                               [-args.offset_range, args.offset_range]],
+                    ax.scatter(
+                        offsets[:, 0], offsets[:, 1],
+                        s=9, c=MODEL_COLORS[spec.key], alpha=0.78,
+                        linewidths=0, rasterized=True,
                     )
-                    ax.imshow(hist.T, extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
-                              origin='lower', cmap='magma',
-                              norm=LogNorm(vmin=1, vmax=max(float(hist.max()), 1.0)))
-                    ax.scatter(offsets[:, 0], offsets[:, 1], s=3, c=MODEL_COLORS[spec.key],
-                               alpha=0.35, linewidths=0)
                 ax.axhline(0, color='white', linewidth=0.7, alpha=0.65)
                 ax.axvline(0, color='white', linewidth=0.7, alpha=0.65)
                 ax.set(xlim=(-args.offset_range, args.offset_range),
@@ -4314,7 +4309,7 @@ def make_figure_2(args: argparse.Namespace) -> Path:
     if with_offsets:
         output_path = output_dir / 'fig-Blob-Net-2-with-diagnostics-draft.png'
         summary['diagnostics_note'] = ('Offsets and F1/RMSE use the displayed example in each row, '
-                                       'rendered as model-colored scatter without a histogram underlay. '
+                                       'rendered as model-colored scatter without a histogram underlay, '
                                        'with the same thresholds and 10 px border exclusion as its TP/FP/FN panels. '
                                        'Offsets are predicted minus ground truth; RMSE uses all matched points, '
                                        'including offsets outside the displayed +/-2 px window.')
