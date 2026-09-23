@@ -124,7 +124,7 @@ Dataset generation runs in parallel by default when it is needed; use `--dataset
 
 ## Experimental Images
 
-The manuscript and SI generation scripts load the publication-ready HDF5 images in `experimental_data/`.
+The manuscript and SI generation scripts load the publication-ready NSID microscopy files in `experimental_data/` through `pyTEMlib.file_tools.open_file`.
 
 ## Reproduce the publication
 
@@ -151,6 +151,8 @@ uv run blobnet-reproduce-publication --target si --device auto --compile-latex
 
 Use `--target all` to run both workflows. Generated files are written under `outputs/`; manuscript figures are copied to `publication/manuscript/figures/` before LaTeX compilation. The packaged checkpoints provide deterministic figure inputs. The separate `blobnet-train-manuscript` command independently regenerates synthetic datasets and retrains the three primary models from the tracked YAML configurations; retrained floating-point weights can vary across hardware and software backends.
 
+For an interactive inference walkthrough, open [`notebooks/quickstart_inference.ipynb`](notebooks/quickstart_inference.ipynb). It loads the three packaged models, compares them on one reproducible simulated image, and ends with an editable path that reads experimental microscopy data through `pyTEMlib.file_tools.open_file` before running the already-loaded models.
+
 ## Python API
 
 ```python
@@ -172,7 +174,7 @@ scripts/
   generate_training_dataset.py
   train_unet.py
 notebooks/                   dataset and experimental-image exploration
-experimental_data/           tracked publication-ready HDF5 images
+experimental_data/           tracked publication-ready NSID microscopy images
 artifacts/manuscript_models/ exact publication checkpoints and training records
 publication/manuscript/      manuscript LaTeX, bibliography, captions, and sections
 ```

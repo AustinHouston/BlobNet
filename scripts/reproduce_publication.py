@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import h5py
+from blobnet.experimental import open_experimental_image
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "artifacts/manuscript_models"
@@ -26,11 +26,11 @@ EXPECTED_CHECKPOINTS = {
     "figure3_hexagonal": "70ede8a0a245c78bb98c9d1ea8672cc55f650e55d3a964357ff49be70e6e90e6",
 }
 EXPECTED_IMAGES = {
-    "pristine_monolayer_MoS2.h5",
-    "Sigma3_coherent_twin_grain_boundary_FCC_Al.h5",
-    "high_angle_grain_boundary_monolayer_WS2.h5",
-    "Al72Ni11Co17_quasicrystal.h5",
-    "gold_implanted_in_TiO2.h5",
+    "pristine_monolayer_MoS2.hf5",
+    "Sigma3_coherent_twin_grain_boundary_FCC_Al.hf5",
+    "high_angle_grain_boundary_monolayer_WS2.hf5",
+    "Al72Ni11Co17_quasicrystal.hf5",
+    "gold_implanted_in_TiO2.hf5",
 }
 
 
@@ -57,15 +57,18 @@ def audit() -> None:
             errors.append(f"checkpoint hash mismatch: {path.relative_to(ROOT)}")
         elif path.stat().st_size >= 100_000_000:
             errors.append(f"checkpoint exceeds GitHub's 100 MB limit: {path.relative_to(ROOT)}")
-    actual_images = {path.name for path in DATA.glob("*.h5")}
+    actual_images = {path.name for path in DATA.glob("*.hf5")}
     if actual_images != EXPECTED_IMAGES:
-        errors.append(f"experimental HDF5 set differs: {sorted(actual_images)}")
-    for path in DATA.glob("*.h5"):
+        errors.append(f"experimental NSID set differs: {sorted(actual_images)}")
+    for path in DATA.glob("*.hf5"):
         if path.stat().st_size >= 100_000_000:
             errors.append(f"image exceeds GitHub's 100 MB limit: {path.relative_to(ROOT)}")
-        with h5py.File(path, "r") as handle:
-            if "image" not in handle or "pixel_size_nm" not in handle["image"].attrs:
-                errors.append(f"invalid publication HDF5 schema: {path.relative_to(ROOT)}")
+        try:
+            image, metadata = open_experimental_image(path)
+            if image.size == 0 or float(metadata["pixel_size_nm"]) <= 0:
+                raise ValueError("empty image or invalid pixel size")
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            errors.append(f"invalid publication NSID file: {path.relative_to(ROOT)} ({error})")
     for relative in ["manuscript.tex", "references.bib", "sections/manuscript.tex"]:
         if not (MANUSCRIPT / relative).is_file():
             errors.append(f"missing manuscript source: publication/manuscript/{relative}")

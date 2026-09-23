@@ -5,13 +5,11 @@ import csv
 import json
 import math
 import os
-import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 import yaml
@@ -33,6 +31,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
 
+from blobnet.experimental import open_experimental_image
 from blobnet.metrics import extract_subpixel_peak_positions, match_coordinate_sets
 from blobnet.networks import build_unet
 from blobnet.synthetic import (
@@ -226,170 +225,27 @@ def _predict_tiled(
     return accumulator / np.maximum(weights, 1e-8)
 
 
-def _find_haadf_with_pytemlib(path: Path) -> np.ndarray | None:
-    try:
-        import pyTEMlib.file_tools as ft
-    except ImportError:
-        return None
-
-    def select_haadf(dataset: Any) -> np.ndarray | None:
-        candidates = [
-            (str(getattr(candidate, 'title', '')), candidate)
-            for candidate in dataset.values()
-            if len(tuple(dimension for dimension in getattr(candidate, 'shape', ()) if dimension != 1)) == 2
-        ]
-        for preferred_title in ('HAADF', 'Ref HAADF'):
-            for title, candidate in candidates:
-                if title == preferred_title:
-                    return np.asarray(candidate, dtype=np.float32)
-        for title, candidate in candidates:
-            if 'HAADF' in title.upper():
-                return np.asarray(candidate, dtype=np.float32)
-        return None
-
-    try:
-        dataset = ft.open_file(str(path))
-    except OSError:
-        with tempfile.TemporaryDirectory(prefix='blobnet-emd-') as temp_dir:
-            copied_path = Path(temp_dir) / path.name
-            shutil.copyfile(path, copied_path)
-            return select_haadf(ft.open_file(str(copied_path)))
-    return select_haadf(dataset)
-
-
-def _find_haadf_with_h5py(path: Path) -> np.ndarray:
-    arrays: list[tuple[int, str, np.ndarray]] = []
-    with h5py.File(path, 'r') as handle:
-        def visit(name: str, obj: Any) -> None:
-            if not hasattr(obj, 'shape') or name.endswith('/Metadata'):
-                return
-            shape = tuple(int(value) for value in obj.shape)
-            if len(shape) >= 2 and np.issubdtype(obj.dtype, np.number):
-                data = np.asarray(obj)
-                data = np.squeeze(data)
-                if data.ndim == 2:
-                    arrays.append((data.size, name, data.astype(np.float32)))
-
-        handle.visititems(visit)
-
-    if not arrays:
-        raise ValueError(f'No 2D numeric image dataset found in {path}')
-    return max(arrays, key=lambda item: item[0])[2]
-
-
 def _load_experimental_image(path: Path) -> np.ndarray:
-    with h5py.File(path, 'r') as handle:
-        if 'image' in handle:
-            return _normalize_image(np.asarray(handle['image'], dtype=np.float32).squeeze())
-    image = _find_haadf_with_pytemlib(path)
-    if image is None:
-        image = _find_haadf_with_h5py(path)
-    return _normalize_image(np.squeeze(image))
-
-
-def _decode_velox_json(dataset: h5py.Dataset, index: int = 0) -> dict[str, Any]:
-    raw = dataset[:, index] if dataset.ndim == 2 else dataset[index]
-    if isinstance(raw, bytes):
-        encoded = raw
-    elif isinstance(raw, str):
-        encoded = raw.encode('utf-8')
-    else:
-        encoded = np.asarray(raw, dtype=np.uint8).tobytes()
-    return json.loads(encoded.split(b'\x00', 1)[0].decode('utf-8'))
+    image, _metadata = open_experimental_image(path)
+    return _normalize_image(image)
 
 
 def _load_velox_displayed_haadf(path: Path, crop_size: int) -> tuple[np.ndarray, float, dict[str, Any]]:
-    """Read the final displayed DCFI(HAADF), or HAADF fallback, from a Velox EMD."""
-    with h5py.File(path, 'r') as handle:
-        if 'image' in handle and 'pixel_size_nm' in handle['image'].attrs:
-            full_image = np.asarray(handle['image'], dtype=np.float32).squeeze()
-            image = _center_crop_or_pad(full_image, int(crop_size))
-            return _normalize_image(image), float(handle['image'].attrs['pixel_size_nm']), {
-                'display_label': str(handle.attrs.get('source_display_label', 'HAADF')),
-                'data_path': '/image',
-                'series_index': int(handle.attrs.get('source_series_index', 0)),
-                'source_shape': list(full_image.shape),
-                'selection': str(handle.attrs.get('selection', '')),
-            }
-        displays = handle.get('Presentation/Displays/ImageDisplay')
-        if displays is None:
-            raise ValueError(f'No Velox image displays found in {path}.')
-
-        candidates: list[tuple[int, str, int, str]] = []
-        for display_dataset in displays.values():
-            display = _decode_velox_json(display_dataset)
-            label = str(display.get('display', {}).get('label', ''))
-            data_path = str(display.get('dataPath', ''))
-            if not data_path or data_path.lstrip('/') not in handle:
-                continue
-            upper_label = label.upper()
-            if 'DCFI' in upper_label and 'HAADF' in upper_label:
-                priority = 0
-            elif 'HAADF' in upper_label:
-                priority = 1
-            else:
-                continue
-            candidates.append((priority, data_path, int(display.get('seriesIndex', 0)), label))
-
-        if not candidates:
-            raise ValueError(f'No displayed HAADF dataset found in {path}.')
-        _priority, data_path, series_index, display_label = min(candidates, key=lambda item: item[0])
-        group = handle[data_path.lstrip('/')]
-        data = group['Data']
-        if data.ndim == 3:
-            series_index = int(np.clip(series_index, 0, data.shape[2] - 1))
-            height, width = int(data.shape[0]), int(data.shape[1])
-            y0 = max((height - int(crop_size)) // 2, 0)
-            x0 = max((width - int(crop_size)) // 2, 0)
-            image = np.asarray(
-                data[y0 : min(y0 + crop_size, height), x0 : min(x0 + crop_size, width), series_index],
-                dtype=np.float32,
-            )
-        else:
-            full_image = np.asarray(data, dtype=np.float32).squeeze()
-            height, width = int(full_image.shape[0]), int(full_image.shape[1])
-            image = _center_crop_or_pad(full_image, int(crop_size))
-
-        metadata_index = min(series_index, group['Metadata'].shape[1] - 1)
-        metadata = _decode_velox_json(group['Metadata'], metadata_index)
-        binary_result = metadata['BinaryResult']
-        pixel_width_nm = float(binary_result['PixelSize']['width']) * 1e9
-        pixel_height_nm = float(binary_result['PixelSize']['height']) * 1e9
-        if not np.isclose(pixel_width_nm, pixel_height_nm):
-            raise ValueError(f'Non-square pixels in {path}: {pixel_width_nm} x {pixel_height_nm} nm.')
-
-    image = _center_crop_or_pad(_normalize_image(image), int(crop_size))
-    return image, float((pixel_width_nm + pixel_height_nm) / 2.0), {
-        'display_label': display_label,
-        'data_path': data_path,
-        'series_index': series_index,
-        'source_shape': [height, width],
+    image, metadata = open_experimental_image(path)
+    source_shape = list(image.shape)
+    image = _center_crop_or_pad(image, int(crop_size))
+    return _normalize_image(image), float(metadata['pixel_size_nm']), {
+        'display_label': str(metadata.get('source_display_label', 'HAADF')),
+        'data_path': 'Channel_000',
+        'series_index': int(metadata.get('source_series_index', 0)),
+        'source_shape': source_shape,
+        'selection': str(metadata.get('selection', '')),
     }
 
 
 def _read_channel_pixel_size_nm(path: Path, channel: str = 'Channel_000') -> float:
-    with h5py.File(path, 'r') as handle:
-        if 'image' in handle and 'pixel_size_nm' in handle['image'].attrs:
-            return float(handle['image'].attrs['pixel_size_nm'])
-
-    import pyTEMlib.file_tools as ft
-
-    def read_pixel_size(dataset: Any) -> float:
-        binary_result = dataset[channel].original_metadata['BinaryResult']
-        width_nm = float(binary_result['PixelSize']['width']) * 1e9
-        height_nm = float(binary_result['PixelSize']['height']) * 1e9
-        if not np.isclose(width_nm, height_nm):
-            raise ValueError(f'Non-square pixels in {path}: {width_nm} x {height_nm} nm.')
-        return float((width_nm + height_nm) / 2.0)
-
-    try:
-        return read_pixel_size(ft.open_file(str(path)))
-    except OSError:
-        with tempfile.TemporaryDirectory(prefix='blobnet-emd-') as temp_dir:
-            copied_path = Path(temp_dir) / path.name
-            shutil.copyfile(path, copied_path)
-            return read_pixel_size(ft.open_file(str(copied_path)))
-
+    _image, metadata = open_experimental_image(path, channel=channel)
+    return float(metadata['pixel_size_nm'])
 
 def _center_crop_or_pad(image: np.ndarray, size: int) -> np.ndarray:
     image = np.asarray(image, dtype=np.float32)
@@ -765,11 +621,11 @@ def make_figure_3(args: argparse.Namespace) -> Path:
 
     fourth_image = getattr(
         args, 'fourth_image',
-        args.data_dir / 'high_angle_grain_boundary_monolayer_WS2.h5',
+        args.data_dir / 'high_angle_grain_boundary_monolayer_WS2.hf5',
     )
     files = [
-        ('MoS$_2$', args.data_dir / 'pristine_monolayer_MoS2.h5'),
-        ('Twin boundary', args.data_dir / 'Sigma3_coherent_twin_grain_boundary_FCC_Al.h5'),
+        ('MoS$_2$', args.data_dir / 'pristine_monolayer_MoS2.hf5'),
+        ('Twin boundary', args.data_dir / 'Sigma3_coherent_twin_grain_boundary_FCC_Al.hf5'),
         ('WS$_2$ (0063)', fourth_image),
         ('Quasicrystal', args.quasicrystal_image),
     ]
@@ -814,7 +670,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
             display_coordinates[:, 0] *= (display_view.shape[0] - 1) / max(native_view.shape[0] - 1, 1)
             display_coordinates[:, 1] *= (display_view.shape[1] - 1) / max(native_view.shape[1] - 1, 1)
         hexagonal_pixel_size_factor = (
-            float(args.ws2_hexagonal_pixel_size_factor) if path.name == 'pristine_monolayer_MoS2.h5' else 1.0
+            float(args.ws2_hexagonal_pixel_size_factor) if path.name == 'pristine_monolayer_MoS2.hf5' else 1.0
         )
         hexagonal_target_pixel_size_nm = float(args.target_pixel_size_nm) * hexagonal_pixel_size_factor
         hexagonal_native_pixels = max(1, int(round(field_of_view_nm / hexagonal_target_pixel_size_nm)))
@@ -829,7 +685,7 @@ def make_figure_3(args: argparse.Namespace) -> Path:
         )
         hexagonal_threshold_rel = (
             float(args.ws2_hexagonal_threshold_rel)
-            if path.name == 'pristine_monolayer_MoS2.h5' else float(args.localization_threshold_rel)
+            if path.name == 'pristine_monolayer_MoS2.hf5' else float(args.localization_threshold_rel)
         )
         hex_coordinates = np.asarray(extract_subpixel_peak_positions(
             hex_prediction, threshold_rel=hexagonal_threshold_rel,
@@ -2003,12 +1859,12 @@ def build_parser() -> argparse.ArgumentParser:
     figure3.add_argument(
         '--quasicrystal-image',
         type=Path,
-        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.h5',
+        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.hf5',
     )
     figure3.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
     figure3.add_argument(
         '--fourth-image', type=Path,
-        default=repo_root / 'experimental_data/high_angle_grain_boundary_monolayer_WS2.h5',
+        default=repo_root / 'experimental_data/high_angle_grain_boundary_monolayer_WS2.hf5',
     )
     figure3.add_argument('--localization-threshold-rel', type=float, default=0.35)
     figure3.add_argument('--peak-min-distance', type=int, default=3)
@@ -2109,7 +1965,7 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument(
         '--quasicrystal-image',
         type=Path,
-        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.h5',
+        default=repo_root / 'experimental_data/Al72Ni11Co17_quasicrystal.hf5',
     )
     all_parser.add_argument('--target-pixel-size-nm', type=float, default=0.027193128874910695)
     all_parser.add_argument('--ws2-hexagonal-pixel-size-factor', type=float, default=0.70)

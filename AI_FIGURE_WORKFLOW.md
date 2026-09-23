@@ -11,7 +11,7 @@ not intended as a training guide.
 - `scripts/` contains command-line workflows. Most figure work lives in
   `scripts/make_manuscript_figures.py`.
 - `configs/` contains YAML configs for datasets and models.
-- `experimental_data/` contains the tracked experimental `.h5` files used for
+- `experimental_data/` contains the tracked experimental `.hf5` NSID files used for
   experimental HAADF figures.
 - `outputs/` contains generated datasets, checkpoints, measurements, sweeps, and
   figure outputs. Many subdirectories are ignored by git.
@@ -64,7 +64,7 @@ uv run blobnet-manuscript-figures figure3 --output-dir outputs/manuscript_figure
 
 ## Experimental Data Figures
 
-Experimental `.h5` inputs live in:
+Experimental `.hf5` NSID inputs live in:
 
 ```text
 experimental_data/
@@ -72,11 +72,11 @@ experimental_data/
 
 Current experimental files:
 
-- `pristine_monolayer_MoS2.h5`
-- `Sigma3_coherent_twin_grain_boundary_FCC_Al.h5`
-- `high_angle_grain_boundary_monolayer_WS2.h5`
-- `Al72Ni11Co17_quasicrystal.h5`
-- `gold_implanted_in_TiO2.h5`
+- `pristine_monolayer_MoS2.hf5`
+- `Sigma3_coherent_twin_grain_boundary_FCC_Al.hf5`
+- `high_angle_grain_boundary_monolayer_WS2.hf5`
+- `Al72Ni11Co17_quasicrystal.hf5`
+- `gold_implanted_in_TiO2.hf5`
 
 Feature measurement summaries used for feature-size matching are expected at:
 
@@ -90,8 +90,8 @@ If the measurement file is missing or stale, regenerate it with:
 uv run python -m scripts.measure_experimental_features --data-dir experimental_data --output-dir outputs/experimental_feature_measurements_local
 ```
 
-The experimental figure code loads HAADF data using `pyTEMlib` when available
-and falls back to reading the largest 2D numeric dataset with `h5py`.
+The experimental figure code loads the curated HAADF channel and its calibration
+from the NSID files using `pyTEMlib.file_tools.open_file`.
 
 ## Regenerating The Current Experimental Outputs
 
@@ -112,7 +112,7 @@ Helpful existing functions:
 - `_load_blobnet_model`: loads a U-Net checkpoint.
 - `_predict_array`: runs model inference on one image.
 - `_predict_tiled`: tiled inference for larger images.
-- `_load_experimental_image`: reads and normalizes an experimental `.h5` image.
+- `_load_experimental_image`: reads and normalizes an experimental `.hf5` image through pyTEMlib.
 - `_make_feature_matched_experimental_view`: DoG background subtraction,
   feature-size matching, and center crop/pad used by Figure 3.
 - `_plot_clean_image`: simple image panel plotting.

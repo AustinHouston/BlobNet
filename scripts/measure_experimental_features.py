@@ -8,7 +8,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.spatial import cKDTree
@@ -23,6 +22,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from blobnet.experimental import open_experimental_image
+
 
 def _normalize_image(image: np.ndarray, low: float = 1.0, high: float = 99.8) -> np.ndarray:
     image = np.asarray(image, dtype=np.float32)
@@ -30,48 +31,9 @@ def _normalize_image(image: np.ndarray, low: float = 1.0, high: float = 99.8) ->
     return np.clip((image - lo) / max(float(hi - lo), 1e-8), 0.0, 1.0).astype(np.float32)
 
 
-def _find_haadf_with_pytemlib(path: Path) -> np.ndarray | None:
-    try:
-        import pyTEMlib.file_tools as ft
-    except ImportError:
-        return None
-
-    dataset = ft.open_file(str(path))
-    for key in dataset.keys():
-        candidate = dataset[key]
-        if getattr(candidate, 'title', '') == 'HAADF':
-            return np.asarray(candidate, dtype=np.float32)
-    return None
-
-
-def _find_haadf_with_h5py(path: Path) -> np.ndarray:
-    arrays: list[tuple[int, str, np.ndarray]] = []
-    with h5py.File(path, 'r') as handle:
-        def visit(name: str, obj: Any) -> None:
-            if not hasattr(obj, 'shape') or name.endswith('/Metadata'):
-                return
-            if len(obj.shape) < 2 or not np.issubdtype(obj.dtype, np.number):
-                return
-            data = np.squeeze(np.asarray(obj))
-            if data.ndim == 2:
-                arrays.append((data.size, name, data.astype(np.float32)))
-
-        handle.visititems(visit)
-
-    if not arrays:
-        raise ValueError(f'No 2D numeric image dataset found in {path}')
-    return max(arrays, key=lambda item: item[0])[2]
-
-
 def load_experimental_image(path: Path) -> np.ndarray:
-    with h5py.File(path, 'r') as handle:
-        if 'image' in handle:
-            return _normalize_image(np.asarray(handle['image'], dtype=np.float32).squeeze())
-    image = _find_haadf_with_pytemlib(path)
-    if image is None:
-        image = _find_haadf_with_h5py(path)
-    return _normalize_image(np.squeeze(image))
-
+    image, _metadata = open_experimental_image(path)
+    return _normalize_image(image)
 
 def detect_blobs(
     image: np.ndarray,
@@ -229,7 +191,7 @@ def write_diagnostic(summary: dict[str, Any], output_dir: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Measure blob feature sizes and spacing in experimental HAADF HDF5 images.')
+    parser = argparse.ArgumentParser(description='Measure blob feature sizes and spacing in experimental HAADF NSID images.')
     parser.add_argument('--data-dir', type=Path, default=Path('experimental_data'))
     parser.add_argument('--output-dir', type=Path, default=Path('outputs/experimental_feature_measurements'))
     parser.add_argument('--dog-small', type=float, default=0.8)
@@ -248,7 +210,7 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summaries = []
-    for path in sorted(args.data_dir.glob('*.h5')):
+    for path in sorted(args.data_dir.glob('*.hf5')):
         summary = summarize_image(path, args)
         write_diagnostic(summary, args.output_dir)
         clean = {key: value for key, value in summary.items() if not key.startswith('_')}

@@ -29,6 +29,7 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter, gaussian_lapl
 from scipy.spatial import cKDTree
 
 from blobnet import synthetic as syn
+from blobnet.experimental import open_experimental_image
 from blobnet.metrics import extract_subpixel_peak_positions, match_coordinate_sets
 from blobnet.networks import build_unet
 from scripts import make_manuscript_figures as mainfig
@@ -136,10 +137,9 @@ def basic_axes(ax, xlabel, ylabel):
 
 def make_gold_tio2_figure(study):
     """Generate the four-panel Au-in-TiO2 figure used at the start of the SI."""
-    image_path = ROOT / 'experimental_data/gold_implanted_in_TiO2.h5'
-    with h5py.File(image_path, 'r') as handle:
-        full_image = np.asarray(handle['image'], dtype=np.float32)
-        pixel_size_nm = float(handle['image'].attrs['pixel_size_nm'])
+    image_path = ROOT / 'experimental_data/gold_implanted_in_TiO2.hf5'
+    full_image, metadata = open_experimental_image(image_path)
+    pixel_size_nm = float(metadata['pixel_size_nm'])
     raw = full_image[256:768, 256:768]
     field = gaussian_filter(raw, 5, mode='reflect')
     field_median = float(np.median(field))

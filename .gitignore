@@ -10,6 +10,7 @@ outputs/
 experimental_data/*
 !experimental_data/README.md
 !experimental_data/*.h5
+!experimental_data/*.hf5
 *.npz
 *.pth
 *.png
