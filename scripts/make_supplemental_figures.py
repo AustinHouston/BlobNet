@@ -13,7 +13,6 @@ import importlib.metadata
 import json
 import shutil
 import subprocess
-import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -27,16 +26,12 @@ import torch
 import yaml
 import h5py
 from scipy.ndimage import distance_transform_edt, gaussian_filter, gaussian_laplace, zoom
-from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
-from torch.utils.data import DataLoader, TensorDataset
 
 from blobnet import synthetic as syn
 from blobnet.metrics import extract_subpixel_peak_positions, match_coordinate_sets
 from blobnet.networks import build_unet
-from blobnet.loss_func import CombinedGaussianLoss
 from scripts import make_manuscript_figures as mainfig
-from scripts.train_unet import train_model
 
 ROOT = Path(__file__).resolve().parents[1]
 FAMILIES = ('square', 'hexagonal', 'random')
@@ -44,19 +39,17 @@ LABELS = {'square': 'Square-Net', 'hexagonal': 'Hex-Net', 'random': 'Blob-Net'}
 COLORS = {'square': '#3167a5', 'hexagonal': '#c77122', 'random': '#23835e'}
 THRESHOLDS = np.array([.1, .2, .3, .35, .45, .55, .65, .73, .785, .85, .9])
 TITLES = {
- 1: 'Synthetic image formation and target construction',
- 2: 'Dataset provenance and realized distributions',
- 3: 'Training histories and checkpoint selection',
- 4: 'Paired cross-geometry generalization',
- 5: 'Detection and matching sensitivity',
- 6: 'Synthetic edges and boundary-localized errors',
- 7: 'Controlled positional disorder',
+ 1: 'Gold implanted in titanium dioxide',
+ 2: 'Square image formation and target construction',
+ 3: 'Hexagonal image formation and target construction',
+ 4: 'Random image formation and target construction',
+ 5: 'Training histories and checkpoint selection',
+ 6: 'Paired cross-geometry generalization',
+ 7: 'Synthetic edges and boundary-localized errors',
  8: 'Experimental preprocessing and disagreement atlas',
- 9: 'Scale transfer under explicit evaluation protocols',
- 10: 'Feature width, spacing, and receptive field',
+ 9: 'Image sampling and scale sensitivity',
+ 10: 'Theoretical receptive field',
  11: 'Noise robustness and a classical baseline',
- 12: 'Training-distribution and random-seed controls',
- 13: 'Tiled inference and Gaussian coordinate refinement',
 }
 
 
@@ -219,7 +212,7 @@ def make_gold_tio2_figure(study):
         loc='outside upper center', ncol=3, frameon=False, fontsize=12,
     )
 
-    stem = 'fig-S01-au-tio2'
+    stem = 'fig-S01'
     for directory in (study.out / 'figures', study.doc / 'figures'):
         directory.mkdir(parents=True, exist_ok=True)
         fig.savefig(directory / f'{stem}.png', dpi=300)
@@ -337,95 +330,42 @@ class Study:
         print(f'Saved {stem}: {caption[:100]}', flush=True)
 
     def s1(self):
-        data = {}
-        for row, family in enumerate(FAMILIES):
-            fig, axes = plt.subplots(3, 3, figsize=(8.5,7.5), constrained_layout=True)
-            config = replace(self.configs[family], image_shape=(128,128))
-            if family == 'random': config = replace(config, min_atoms=65,max_atoms=85)
-            else: config = replace(config, min_atoms=20)
-            rng = np.random.default_rng(101 + row)
-            cloud = syn.point_cloud_from_config(config, rng)
-            rec = syn.render_atom_image(cloud.coordinates, config, rng, target_coordinates=cloud.target_coordinates,
-                                        return_stages=True)
-            for col, (name, array) in enumerate(rec['stages'].items()):
-                show(axes.flat[col], array, name.replace('_',' '))
-            show(axes.flat[8], rec['target'], 'target: max Gaussians', rec['coordinates'])
-            fig.suptitle(family.capitalize(), fontsize=12)
-            data[family] = dict(config=asdict(config), count_scale=rec['count_scale'], total_counts=rec['total_counts'],
-                                visible=len(rec['coordinates']), rendered=len(rec['rendered_coordinates']))
-            self.save(1, fig, data[family], f'{family.capitalize()} geometry: sequential snapshots from the production renderer with unchanged random draws. Each panel uses its own grayscale range to expose weak components. Inputs sum atomic Gaussians; targets take their pixelwise maximum. Off-frame support is rendered before cropping; only in-frame centers receive labels. Poisson scale is a peak-intensity scale, not image-total electron dose. Examples are 128-pixel explanatory crops with declared atom counts.', ['', '-b', '-c'][row])
-        # A dedicated border/target profile panel makes the label convention testable.
-        cfg = replace(self.configs['random'], image_shape=(48,48), target_sigma=2., edge_padding=16)
-        coords = np.array([[24.,-1.],[24.,8.],[24.,12.]], np.float32)
-        rec = syn.render_atom_image(coords,cfg,np.random.default_rng(51),target_coordinates=coords[1:],
-                                   intensities=np.ones(3),sigmas=np.full(3,2.),return_stages=True)
-        fig, ax = plt.subplots(1,3,figsize=(10,3),constrained_layout=True)
-        show(ax[0], rec['stages']['atomic_contrast'], 'Off-frame atomic support', coords[1:])
-        show(ax[1], rec['target'], 'Only in-frame targets', coords[1:])
-        ax[2].plot(rec['stages']['atomic_contrast'][24],label='summed input')
-        ax[2].plot(rec['target'][24],label='maximum target'); ax[2].legend()
-        basic_axes(ax[2], 'x (px)', 'Intensity / target')
-        self.save(1,fig,{'coordinates':coords},'Border and overlap conventions. The atom centered at x=-1 contributes image intensity but no target. Overlapping target peaks use a maximum rather than an intensity sum.', '-d')
+        return make_gold_tio2_figure(self)
+
+    def _image_formation(self, family, number):
+        config = replace(self.configs[family], image_shape=(128,128))
+        if family == 'random':
+            config = replace(config, min_atoms=65, max_atoms=85)
+        else:
+            config = replace(config, min_atoms=20)
+        rng = np.random.default_rng(99 + number)
+        cloud = syn.point_cloud_from_config(config, rng)
+        rec = syn.render_atom_image(
+            cloud.coordinates, config, rng,
+            target_coordinates=cloud.target_coordinates, return_stages=True,
+        )
+        fig, axes = plt.subplots(3, 3, figsize=(8.5,7.5), constrained_layout=True)
+        for axis, (name, array) in zip(axes.flat, rec['stages'].items()):
+            show(axis, array, name.replace('_',' '))
+        show(axes.flat[8], rec['target'], 'target: max Gaussians', rec['coordinates'])
+        fig.suptitle(family.capitalize(), fontsize=12)
+        data = dict(
+            config=asdict(config), count_scale=rec['count_scale'],
+            total_counts=rec['total_counts'], visible=len(rec['coordinates']),
+            rendered=len(rec['rendered_coordinates']),
+        )
+        self.save(number, fig, data, f'{family.capitalize()} geometry: sequential snapshots from the production renderer with unchanged random draws. Each panel uses its own grayscale range to expose weak components. Inputs sum atomic Gaussians; targets take their pixelwise maximum. Examples are 128-pixel explanatory crops.')
 
     def s2(self):
-        audit = {}; rows = []; occupancy = {}; examples = {}
-        for family in FAMILIES:
-            folder = ROOT / f'outputs/datasets/{family}_2026_06_24a'
-            manifest_path = folder / 'dataset_manifest.yaml'
-            manifest = yaml.safe_load(manifest_path.read_text()) if manifest_path.exists() else None
-            audit[family] = dict(path=folder, manifest=manifest, actual_counts={}, sha256={}, exact_training_provenance='unverified')
-            occupancy[family] = np.zeros((16,16))
-            for split in ('train','val','test'):
-                paths = sorted((folder / split).glob('*.npz'))
-                audit[family]['actual_counts'][split] = len(paths)
-                for j,p in enumerate(paths):
-                    audit[family]['sha256'][str(p.relative_to(folder))] = digest(p)
-                    with np.load(p) as z:
-                        xy=z['coordinates']; im=z['image']; target=z['target']
-                        spacing=cKDTree(xy).query(xy,k=2)[0][:,1] if len(xy)>1 else np.array([np.nan])
-                        rows.append(dict(family=family,split=split,index=j,count=len(xy),spacing=float(np.median(spacing)),
-                          sigma=float(np.mean(z['sigmas'])), intensity=float(np.mean(z['intensities'])),
-                          foreground=float(np.mean(target>.1)), image_std=float(im.std()),
-                          background_std=float(im[target<.01].std()) if np.any(target<.01) else np.nan,
-                          counts=int(z['total_counts']) if 'total_counts' in z else None))
-                        occupancy[family]+=np.histogram2d(xy[:,0],xy[:,1],bins=16,range=[[0,im.shape[0]],[0,im.shape[1]]])[0]
-                        examples.setdefault(family,(im.copy(),xy.copy()))
-        # Report exact duplicates across splits using image/coordinate payloads,
-        # not compressed-file hashes (metadata compression can differ).
-        hashes={}; duplicates=[]
-        for family in FAMILIES:
-            folder=ROOT/f'outputs/datasets/{family}_2026_06_24a'
-            for split in ('train','val','test'):
-                for p in sorted((folder/split).glob('*.npz')):
-                    with np.load(p) as z:
-                        h=hashlib.sha256(z['image'].tobytes()+z['coordinates'].tobytes()).hexdigest()
-                    if h in hashes and hashes[h][1]!=split: duplicates.append([hashes[h], [family,split,str(p)]])
-                    hashes[h]=[family,split,str(p)]
-        fig,axes=plt.subplots(2,4,figsize=(13,6),constrained_layout=True)
-        fields=['count','spacing','sigma','intensity','foreground','image_std','background_std','counts']
-        for ax,field in zip(axes.flat,fields):
-            positions=[]; values=[]; names=[]
-            for fi,family in enumerate(FAMILIES):
-                for si,split in enumerate(('train','val','test')):
-                    vals=[r[field] for r in rows if r['family']==family and r['split']==split and r[field] is not None]
-                    if vals:
-                        bp=ax.boxplot(vals,positions=[fi*4+si],widths=.65,patch_artist=True,showfliers=False)
-                        bp['boxes'][0].set_facecolor(COLORS[family]); positions.append(fi*4+si); names.append(split)
-            ax.set_xticks([1,5,9],['Square','Hex','Random']); ax.set_title(field.replace('_',' ')); ax.grid(axis='y',alpha=.2)
-        self.save(2,fig,dict(audit=audit,rows=rows,cross_split_exact_duplicates=duplicates),
-          'Realized distributions of every locally available saved sample; within each family, boxes are train/validation/test from left to right. Original data generation and training took place on another computer. These files are a local snapshot, not the original manuscript training datasets. Split counts and file hashes are supplied in the source data. Absence of exact duplicates does not prove independence of generative processes.')
-        fig,axes=plt.subplots(3,3,figsize=(10,9),constrained_layout=True)
-        for row,family in enumerate(FAMILIES):
-            im,xy=examples[family]
-            show(axes[row,0],im,f'{family}: example')
-            axes[row,1].imshow(occupancy[family]/max(occupancy[family].sum(),1),cmap='viridis'); axes[row,1].set_title('Normalized spatial occupancy')
-            axes[row,1].set_xticks([]); axes[row,1].set_yticks([])
-            field=np.histogram2d(xy[:,0],xy[:,1],bins=128,range=[[0,im.shape[0]],[0,im.shape[1]]])[0]
-            field-=field.mean(); spec=np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(field)))**2)
-            axes[row,2].imshow(spec,cmap='magma'); axes[row,2].set_title('Coordinate power spectrum'); axes[row,2].set_xticks([]); axes[row,2].set_yticks([])
-        self.save(2,fig,{'occupancy':occupancy},'Spatial coverage and coordinate spectra reveal geometry and sampling correlations. Spectra are illustrative individual realizations; occupancy aggregates the audited local files.', '-b')
+        return self._image_formation('square', 2)
 
     def s3(self):
+        return self._image_formation('hexagonal', 3)
+
+    def s4(self):
+        return self._image_formation('random', 4)
+
+    def s5(self):
         fig,axes=plt.subplots(1,3,figsize=(12,3.5),constrained_layout=True); records={}
         for ax,family in zip(axes,FAMILIES):
             p=self.args.model_dir/family
@@ -438,9 +378,9 @@ class Study:
             ax.axvline(metrics['best_epoch'],color='#999999',ls=':'); ax.set_title(LABELS[family])
             basic_axes(ax,'Epoch','Heatmap loss'); ax.legend(fontsize=8)
             records[family]=dict(metrics=metrics,config=config,checkpoint=self.checkpoints[family],history=rows)
-        self.save(3,fig,records,'Recovered original manuscript-model histories. Vertical lines mark the saved best-validation epochs. All models have 1,927,841 trainable parameters. Absolute losses across geometries are not an accuracy ranking. Stopping patience counts epochs without an improvement exceeding 0.0005, whereas a checkpoint is saved on any new validation minimum. New repeated-seed controls are reported in S12.')
+        self.save(5,fig,records,'Recovered original manuscript-model histories. Vertical lines mark the saved best-validation epochs. All models have 1,927,841 trainable parameters. Absolute losses across geometries are not an accuracy ranking. Stopping patience counts epochs without an improvement exceeding 0.0005, whereas a checkpoint is saved on any new validation minimum. ')
 
-    def s4(self):
+    def s6(self):
         fig,axes=plt.subplots(3,4,figsize=(13,9),constrained_layout=True); output={}
         for row,family in enumerate(FAMILIES):
             records=self.corpus(family,'test'); results={}
@@ -452,48 +392,14 @@ class Study:
                 axes[row,col].boxplot(vals,tick_labels=['Square','Hex','Blob'],showfliers=False)
                 axes[row,col].set_title(f'{family}: {metric}'); axes[row,col].grid(axis='y',alpha=.2)
             output[family]['paired_F1_difference']={m:bootstrap_paired([r['f1'] for r in results['random']],[r['f1'] for r in results[m]]) for m in ('square','hexagonal')}
-            print('S4',family, {m: output[family][m]['pooled']['f1'] for m in FAMILIES},flush=True)
-        self.save(4,fig,output,f'Paired evaluation of all three archived models on the same {self.args.samples} independently generated 512-pixel images per geometry. Threshold 0.35, 3-pixel matching radius, 3-pixel peak separation, 5-pixel centroid window. Boxes show per-image distributions; pooled metrics and 2,000-resample paired image-bootstrap intervals are saved in JSON. Test seeds begin at 8,000,000 and were not used for calibration. Current configurations define this new experiment; it does not retroactively identify the original training datasets.')
+            print('S6',family, {m: output[family][m]['pooled']['f1'] for m in FAMILIES},flush=True)
+        self.save(6,fig,output,f'Paired evaluation of all three archived models on the same {self.args.samples} independently generated 512-pixel images per geometry. Threshold 0.35, 3-pixel matching radius, 3-pixel peak separation, 5-pixel centroid window. Boxes show per-image distributions; pooled metrics and 2,000-resample paired image-bootstrap intervals are saved in JSON. Test seeds begin at 8,000,000 and were not used for calibration. Current configurations define this new experiment; it does not retroactively identify the original training datasets.')
 
     def edge(self,family,index,validation=False):
         funcs={'mos2':mainfig._make_mos2_edge_record,'sto':mainfig._make_sto_edge_record,'graphene':mainfig._make_graphene_rattled_edge_record}
         return funcs[family]((512,512),(9_000_000 if validation else 10_000_000)+index,(1.15,2.65),total_counts_range=(64.,64.),quiet_background=True)
 
-    def s5(self):
-        fig,axes=plt.subplots(3,3,figsize=(12,9),constrained_layout=True); data={}
-        for row,family in enumerate(('mos2','sto','graphene')):
-            records=[self.edge(family,i) for i in range(self.args.replicates)]
-            validation=[self.edge(family,i,True) for i in range(self.args.validation_samples)]
-            data[family]={}
-            for model in FAMILIES:
-                preds=[self.predict(model,r['image']) for r in records]
-                vp=[self.predict(model,r['image']) for r in validation]
-                vscore=[pooled([evaluate(p,r['coordinates'],float(t),border=10) for p,r in zip(vp,validation)])['f1'] for t in THRESHOLDS]
-                selected=float(THRESHOLDS[np.argmax(vscore)])
-                metrics=[pooled([evaluate(p,r['coordinates'],float(t),border=10) for p,r in zip(preds,records)]) for t in THRESHOLDS]
-                data[family][model]=dict(thresholds=THRESHOLDS,metrics=metrics,validation_threshold=selected,validation_f1=vscore)
-                axes[row,0].plot(THRESHOLDS,[m['f1'] for m in metrics],label=LABELS[model],color=COLORS[model])
-                axes[row,0].scatter([selected],[metrics[list(THRESHOLDS).index(selected)]['f1']],color=COLORS[model],s=35)
-                axes[row,1].plot([m['recall'] for m in metrics],[m['precision'] for m in metrics],color=COLORS[model])
-                radii=[1,2,3,4,5]
-                radial=[pooled([evaluate(p,r['coordinates'],selected,radius=d,border=10) for p,r in zip(preds,records)]) for d in radii]
-                axes[row,2].plot(radii,[m['f1'] for m in radial],color=COLORS[model]); data[family][model]['radius_sensitivity']=radial
-            axes[row,0].axvline(mainfig.FIGURE2_TUNED_THRESHOLDS[{'mos2':'mos2_edge','sto':'srtio3_edge','graphene':'graphene_rattled_edge'}[family]],color='black',ls=':',label='Main Fig. 2 selected')
-            for col,(x,y) in enumerate([('Relative threshold','F1'),('Recall','Precision'),('Match radius (px)','F1')]): basic_axes(axes[row,col],x,y)
-            axes[row,0].set_title(family); axes[row,0].legend(fontsize=6)
-        self.save(5,fig,data,'Edge threshold sensitivity on independent test realizations. Colored dots mark each model\'s independently validation-selected threshold; dotted lines identify the main-figure thresholds selected to favor Blob-Net on the displayed examples. The latter selection is exploratory. All curves exclude a 10-pixel image border; precision-recall points are threshold operating points, not calibrated posterior probabilities.')
-        fig,axes=plt.subplots(1,3,figsize=(11,3.5),constrained_layout=True); out={}
-        records=self.corpus('random','test',self.args.replicates)
-        for ax,model in zip(axes,FAMILIES):
-            grid=np.zeros((4,4)); preds=[self.predict(model,r['image']) for r in records]
-            for i,sep in enumerate([1,2,3,5]):
-                for j,window in enumerate([3,5,7,9]):
-                    grid[i,j]=pooled([evaluate(p,r['coordinates'],separation=sep,window=window) for p,r in zip(preds,records)])['f1']
-            im=ax.imshow(grid,vmin=0,vmax=1,cmap='viridis'); ax.set_xticks(range(4),[3,5,7,9]); ax.set_yticks(range(4),[1,2,3,5]); ax.set(xlabel='Centroid window (px)',ylabel='Peak separation (px)',title=LABELS[model]); out[model]=grid
-        fig.colorbar(im,ax=list(axes),label='F1',shrink=.8)
-        self.save(5,fig,out,'Random-image postprocessing sensitivity at fixed threshold 0.35 and matching radius 3 pixels. Each grid cell uses identical images and cached predictions. This separates heatmap quality from peak-extraction choices.', '-b')
-
-    def s6(self):
+    def s7(self):
         fig,axes=plt.subplots(3,5,figsize=(15,9),constrained_layout=True); output={}
         for row,family in enumerate(('mos2','sto','graphene')):
             mask=edge_mask(family,(512,512)); signed=signed_distance(mask)
@@ -529,55 +435,7 @@ class Study:
                 output[family]['models'][model]=dict(fp=fp_hist,truth=true_hist,tp=tp_hist,fp_per_10000px=rates,recall=recall,rmse=rms,per_image=per_image)
             basic_axes(axes[row,3],'Signed boundary distance (px)','FP / 10,000 px'); basic_axes(axes[row,4],'Signed boundary distance (px)','Recall')
             axes[row,3].axvline(0,color='k',ls=':'); axes[row,4].axvline(0,color='k',ls=':'); axes[row,3].legend(fontsize=6)
-        self.save(6,fig,output,f'Construction and boundary-distance diagnostics for {self.args.replicates} independent noise/vacancy/displacement realizations per material, with fixed boundary geometries. Gray sites precede masking, vacancies and displacement; orange sites are retained ground truth. Signed distance is positive inside the ideal material mask; displaced atoms can cross it. FP rates are area-normalized, recall is atom-normalized. Fixed threshold 0.35; 10-pixel image-border exclusion. This tests stochastic reproducibility, not the diversity of all possible edge shapes. Species intensities, widths, masks and displacement rules are recorded in source data.')
-
-    def s7(self):
-        levels=[0.,.1,.5,1.,2.5,4.]; fig,axes=plt.subplots(2,3,figsize=(12,7),constrained_layout=True); output=[]
-        y,x=np.mgrid[18:240:15,18:240:15]; xy=np.c_[y.ravel(),x.ravel()].astype(np.float32)
-        xy=xy[xy[:,0]>100+.2*xy[:,1]]; cfg=controlled_config((256,256))
-        for std in levels:
-            collected={m:[] for m in FAMILIES}; regional={m:{'edge':[],'interior':[]} for m in FAMILIES}; common={m:[] for m in FAMILIES}
-            for i in range(self.args.replicates):
-                rng=np.random.default_rng(11_000_000+i); shift=rng.normal(size=xy.shape)
-                moved=xy+std*shift; rec=syn.render_atom_image(moved,cfg,np.random.default_rng(12_000_000+i),intensities=np.full(len(xy),.8),sigmas=np.full(len(xy),2.))
-                results={m:evaluate(self.predict(m,rec['image']),moved,border=10) for m in FAMILIES}
-                ids={m:cKDTree(moved).query(r['matched_truth'])[1] if r['tp'] else np.array([],int) for m,r in results.items()}
-                common_ids=set.intersection(*(set(ids[m].tolist()) for m in FAMILIES))
-                for m,r in results.items():
-                    collected[m].append(r)
-                    common[m].extend([float(e) for k,e in zip(ids[m],r['errors']) if k in common_ids])
-                    for zone in ('edge','interior'):
-                        def zone_mask(p):
-                            d=(p[:,0]-100-.2*p[:,1])/np.sqrt(1.04)
-                            return d<30 if zone=='edge' else d>=30
-                        t=r['truth'][zone_mask(r['truth'])]; p=r['positions'][zone_mask(r['positions'])]
-                        rr=match_coordinate_sets(p,t,max_distance=3.); regional[m][zone].append(rr)
-                if i==0 and std in (0.,2.5): show(axes[0,0 if std==0 else 1],rec['image'],f'Displacement SD {std:g} px',moved)
-            for m in FAMILIES:
-                output.append(dict(std=std,model=m,metrics=pooled(collected[m]),
-                  edge=pooled(regional[m]['edge']),interior=pooled(regional[m]['interior']),
-                  common_rmse=np.sqrt(np.mean(np.square(common[m]))) if common[m] else np.nan,common_matches=len(common[m])))
-        for m in FAMILIES:
-            r=[r for r in output if r['model']==m]
-            for ax,key in [(axes[0,2],'f1'),(axes[1,0],'rmse')]: ax.plot(levels,[v['metrics'][key] for v in r],label=LABELS[m],color=COLORS[m])
-            axes[1,1].plot(levels,[v['common_rmse'] for v in r],color=COLORS[m]); axes[1,2].plot(levels,[v['edge']['recall'] for v in r],color=COLORS[m],label=LABELS[m]); axes[1,2].plot(levels,[v['interior']['recall'] for v in r],color=COLORS[m],ls='--')
-        for ax,ylabel in [(axes[0,2],'F1'),(axes[1,0],'Matched RMSE (px)'),(axes[1,1],'Common-subset RMSE (px)'),(axes[1,2],'Recall: edge / interior (dashed)')]: basic_axes(ax,'Displacement SD (px)',ylabel)
-        axes[0,2].legend(fontsize=7)
-        self.save(7,fig,output,'Controlled square-edge displacement sweep. Brightness, Gaussian width, vacancies (none), material geometry and noise seeds are fixed within each replicate; only the amplitude of the same displacement field changes. Solid/dashed regional recall separates a 30-pixel edge band from the interior. Common-subset RMSE uses the same ground-truth atoms successfully matched by every model. This intervention isolates displacement but does not reproduce every material-specific difference in main Figure 2.')
-
-    def experimental(self):
-        files=['pristine_monolayer_MoS2.h5','Sigma3_coherent_twin_grain_boundary_FCC_Al.h5','high_angle_grain_boundary_monolayer_WS2.h5','Al72Ni11Co17_quasicrystal.h5']
-        result=[]
-        for name in files:
-            path=ROOT/'experimental_data'/name
-            raw=mainfig._load_experimental_image(path); pixel=mainfig._read_channel_pixel_size_nm(path); selection=None
-            # This is an explicit SI protocol, equal for both networks; it is
-            # deliberately not claimed to be an exact replay of all main panels.
-            display,native,transform=mainfig._make_fixed_fov_resolution_view(raw,.8,8.,512,max(64,int(round(512*pixel/.025))))
-            result.append(dict(name=name,path=path,source=raw,display=display,image=native,
-                               pixel_nm=pixel,actual_inference_pixel_nm=512*pixel/native.shape[0],
-                               transform=transform,selection=selection,sha256=digest(path)))
-        return result
+        self.save(7,fig,output,f'Construction and boundary-distance diagnostics for {self.args.replicates} independent noise/vacancy/displacement realizations per material, with fixed boundary geometries. Gray sites precede masking, vacancies and displacement; orange sites are retained ground truth. Signed distance is positive inside the ideal material mask; displaced atoms can cross it. FP rates are area-normalized, recall is atom-normalized. Fixed threshold 0.35; 10-pixel image-border exclusion. This tests stochastic reproducibility, not the diversity of all possible edge shapes. Species intensities, widths, masks and displacement rules are recorded in source data.')
 
     def s8(self):
         images=self.experimental(); fig,axes=plt.subplots(4,4,figsize=(12,12),constrained_layout=True); output=[]
@@ -661,48 +519,15 @@ class Study:
         self.save(9,fig,output,'Three-model scale transfer. Top: interpolated copies of identical noisy scenes with fixed physical field of view and atom identities (endpoint-aligned coordinate transforms). Bottom: freshly rendered scenes with scaled feature widths/minimum separations, fixed 256-pixel array and requested count range; actual counts are recorded because packing can saturate. Solid: threshold 0.35 and 3-pixel tolerance. Dashed: independently validation-selected threshold, same tolerance. Dotted: threshold 0.35 and physical-distance-preserving tolerance. The 0.106223 angstrom reference is an explicit scale convention for synthetic data, not a calibrated dose experiment. RMSE is conditional on matches; TP counts and precision are supplied in source data.')
 
     def s10(self):
-        widths=[.8,1.4,2.,3.,4.5,6.]; spacings=[7.,11.,15.,24.,48.,80.]; output={m:np.zeros((6,6)) for m in FAMILIES}
-        for wi,width in enumerate(widths):
-            for si,spacing in enumerate(spacings):
-                results={m:[] for m in FAMILIES}
-                for i in range(max(2,self.args.replicates//4)):
-                    rng=np.random.default_rng(13_000_000+i)
-                    # A uniform periodic test grid provides exact spacing; independent
-                    # phase and intensity vary across replicates. No Z/brightness confound.
-                    yy,xx=np.meshgrid(np.arange(16,240,spacing),np.arange(16,240,spacing),indexing='ij')
-                    coords=np.c_[yy.ravel(),xx.ravel()]+rng.uniform(-2,2,(1,2))
-                    rec=syn.render_atom_image(coords,controlled_config((256,256)),np.random.default_rng(14_000_000+i),intensities=np.full(len(coords),.8),sigmas=np.full(len(coords),width))
-                    for m in FAMILIES: results[m].append(evaluate(self.predict(m,rec['image']),coords))
-                for m in FAMILIES: output[m][wi,si]=pooled(results[m])['f1']
-        fig,axes=plt.subplots(1,3,figsize=(12,4),constrained_layout=True)
-        for ax,m in zip(axes,FAMILIES):
-            im=ax.imshow(output[m],vmin=0,vmax=1,cmap='viridis',origin='lower',aspect='auto')
-            ax.set_xticks(range(6),spacings); ax.set_yticks(range(6),widths); ax.set(xlabel='Spacing (px)',ylabel='Gaussian sigma (px)',title=LABELS[m])
-            # Bounds of the current configs, clearly distinguished from verified training provenance.
-            ax.add_patch(plt.Rectangle((.95,.95),1.05,2.05,fill=False,edgecolor='white',ls='--',lw=1.5))
-        fig.colorbar(im,ax=list(axes),label='F1',shrink=.8)
-        self.save(10,fig,dict(widths=widths,spacings=spacings,f1=output),'Independent feature-width/spacing map on controlled square arrays with constant amplitude and noise. Each cell uses identical images for all models. White dashed regions approximately indicate current configuration ranges, not recovered checkpoint training bounds. Gaussian sigma is reported directly; FWHM is 2.355 times sigma. This grid separates width from brightness, unlike a species-dependent intensity illustration.')
-        fig,axes=plt.subplots(1,3,figsize=(12,3.5),constrained_layout=True)
         stages=['input','enc1','pool1','enc2','pool2','enc3','pool3','bottleneck']
-        rf=[1,5,6,14,16,32,36,68]; axes[0].plot(range(8),rf,'o-',color='#444444'); axes[0].set_xticks(range(8),stages,rotation=50,ha='right'); axes[0].set_ylabel('Theoretical receptive field (px)')
-        axes[0].set_title('Bottleneck RF = 68 px')
-        contexts={}; yy,xx=np.mgrid[0:128,0:128]; radius=np.hypot(yy-64,xx-64); central=np.exp(-((yy-64)**2+(xx-64)**2)/8).astype(np.float32)
-        for name,family in [('square','square'),('hexagonal','hexagonal'),('random','random')]:
-            cfg=replace(self.configs[family],image_shape=(128,128))
-            if family=='random': cfg=replace(cfg,min_atoms=60,max_atoms=70)
-            else: cfg=replace(cfg,min_atoms=20)
-            ctx=self.record(family,'test',77,cfg)['image'].copy(); ctx[radius<18]=central[radius<18]
-            contexts[name]=ctx
-        context_data={}
-        for m in FAMILIES:
-            vals=[float(self.predict(m,im)[64,64]) for im in contexts.values()]
-            axes[1].plot(list(contexts),vals,'o-',label=LABELS[m],color=COLORS[m]); context_data[m]=vals
-        axes[1].set(ylabel='Central heatmap value',title='Same central 18-px-radius patch'); axes[1].legend(fontsize=6)
-        model=self.model('random'); inp=torch.from_numpy(contexts['random']).to(self.device)[None,None].requires_grad_(True)
-        val=torch.sigmoid(model(inp))[0,0,64,64]; grad=torch.autograd.grad(val,inp)[0][0,0].detach().cpu().numpy()
-        axes[2].imshow(np.log10(np.abs(grad)+1e-12),cmap='magma'); axes[2].set_title('Blob-Net input-gradient magnitude (log)'); axes[2].set_xticks([]); axes[2].set_yticks([])
-        self.save(10,fig,dict(stages=stages,rf=rf,context_values=context_data,output_dependency='At output phase (64,64), decoder/upsampling yields 92 input pixels of support in each axis for this architecture; validate with structural propagation test. Different phases shift endpoints.',gradient=grad),
-          'Architecture and context intervention. The 68-pixel bottleneck RF is not the output RF: decoder convolutions extend output support (92 pixels for the tested phase). Evaluation-mode BatchNorm uses stored statistics. Central intensity pixels within radius 18 are held exactly fixed while the external context changes; no post-intervention normalization is applied. Context-response differences and a single input-gradient map are diagnostic examples, not proof of complete locality or a population-level effective RF.', '-b')
+        rf=[1,5,6,14,16,32,36,68]
+        fig, ax = plt.subplots(figsize=(6,4), constrained_layout=True)
+        ax.plot(range(len(stages)), rf, 'o-', color='#444444')
+        ax.set_xticks(range(len(stages)), stages, rotation=50, ha='right')
+        ax.set_ylabel('Theoretical receptive field (px)')
+        ax.set_title('Bottleneck RF = 68 px')
+        self.save(10, fig, dict(stages=stages, rf=rf),
+                  'Theoretical receptive field through the encoder and bottleneck.')
 
     def s11(self):
         experiments={'Poisson scale':[2.,8.,32.,128.,512.], 'Read noise SD':[0.,.03,.08,.15,.3], 'Background amplitude':[0.,.05,.15,.3,.6]}
@@ -737,114 +562,6 @@ class Study:
             basic_axes(axes[0,col],name,'F1'); basic_axes(axes[1,col],name,'Matched RMSE (px)'); axes[0,col].legend()
         self.save(11,fig,data,'Synthetic noise/background robustness with a scale-normalized Laplacian-of-Gaussian baseline. Each method receives identical images. Thresholds, and LoG sigma, are selected independently for each condition on validation images only, then frozen for test evaluation. One nuisance parameter changes at a time; identical seeds retain paired latent scenes where the generator permits. Poisson scale is not a calibrated microscope dose. Source data include precision, recall, TP/FP/FN and calibration settings.')
 
-    def s12(self):
-        """Independent repeat-training experiment with declared compact crops.
-
-        Training data are fixed across initialization seeds within a regime;
-        validation and test use distinct million-offset seeds. These are new
-        SI runs, never relabeled as original manuscript training histories.
-        """
-        regimes=['square','hexagonal','random','wide_random','dense_random']; data=[]; histories={}
-        for regime in regimes:
-            family=regime if regime in FAMILIES else 'random'
-            cfg=replace(self.configs[family],image_shape=(self.args.training_size,self.args.training_size))
-            area=(self.args.training_size/512)**2
-            if family=='random': cfg=replace(cfg,min_atoms=max(16,int(1300*area)),max_atoms=max(20,int(1500*area)))
-            else: cfg=replace(cfg,min_atoms=max(12,int(200*area)))
-            if regime=='wide_random': cfg=replace(cfg,sigma_range=(1.,4.5),min_separation_range=(8.,20.))
-            if regime=='dense_random': cfg=replace(cfg,sampling_mode='relaxed_dense',min_atoms=max(20,int(1800*area)),max_atoms=max(24,int(2000*area)),relaxation_iterations=12)
-            # Materialize and fingerprint the precise new training set.
-            training=[self.record(family,'training',i,cfg) for i in range(self.args.training_samples)]
-            validation=[self.record(family,'validation',i+1000,cfg) for i in range(self.args.training_validation_samples)]
-            tx=torch.from_numpy(np.stack([r['image'] for r in training]))[:,None]
-            ty=torch.from_numpy(np.stack([r['target'] for r in training]))[:,None]
-            vx=torch.from_numpy(np.stack([r['image'] for r in validation]))[:,None]
-            vy=torch.from_numpy(np.stack([r['target'] for r in validation]))[:,None]
-            for seed in self.args.training_seeds:
-                spec=dict(regime=regime,config=asdict(cfg),seed=seed,epochs=self.args.training_epochs,
-                   samples=self.args.training_samples,val_samples=self.args.training_validation_samples,batch_size=16,
-                   training_payload_sha256=hashlib.sha256(tx.numpy().tobytes()+ty.numpy().tobytes()).hexdigest(),
-                   learning_rate=.001,filters=[32,64,128,256],dropout=.2,
-                   loss=dict(mse_weight=.5,peak_weight=.5,threshold=.1,peak_boost=5.,from_logits=True))
-                folder=self.out/'training'/f'{regime}_seed{seed}_{fingerprint(spec)}'; folder.mkdir(parents=True,exist_ok=True)
-                cp=folder/'unet_best.pth'; history_path=folder/'summary.json'
-                torch.manual_seed(seed); np.random.seed(seed)
-                model=build_unet(num_filters=[32,64,128,256],dropout=.2).to(self.device)
-                if cp.exists() and history_path.exists():
-                    model.load_state_dict(torch.load(cp,map_location='cpu',weights_only=False)['model_state_dict']); hist=json.loads(history_path.read_text())
-                else:
-                    generator=torch.Generator().manual_seed(seed)
-                    train_loader=DataLoader(TensorDataset(tx,ty),batch_size=16,shuffle=True,generator=generator)
-                    val_loader=DataLoader(TensorDataset(vx,vy),batch_size=16)
-                    started=time.time()
-                    model,tr,va=train_model(model,train_loader,val_loader,self.args.training_epochs,
-                      CombinedGaussianLoss(),torch.optim.Adam(model.parameters(),lr=.001),self.device,str(folder/'unet'),
-                      progress_interval=99999,early_stopping_patience=6,early_stopping_min_delta=.0005)
-                    hist=dict(spec=spec,train=tr,validation=va,best_epoch=int(np.argmin(va))+1,seconds=time.time()-started,device=str(self.device))
-                    dump(history_path,hist)
-                model.eval(); histories[f'{regime}/{seed}']=hist
-                for test_family in FAMILIES:
-                    tc=replace(self.configs[test_family],image_shape=(self.args.training_size,self.args.training_size))
-                    if test_family=='random': tc=replace(tc,min_atoms=max(16,int(1300*area)),max_atoms=max(20,int(1500*area)))
-                    else: tc=replace(tc,min_atoms=max(12,int(200*area)))
-                    records=[self.record(test_family,'test',i+2000,tc) for i in range(self.args.training_test_samples)]
-                    results=[]
-                    for record in records:
-                        p=mainfig._predict_array(model,record['image'],self.device); results.append(evaluate(p,record['coordinates']))
-                    data.append(dict(regime=regime,seed=seed,test_family=test_family,metrics=pooled(results),per_image=[compact(r) for r in results],checkpoint=cp,sha256=digest(cp)))
-                del model
-                if self.device.type=='mps': torch.mps.empty_cache()
-                print('S12 completed',regime,seed,flush=True)
-        fig,axes=plt.subplots(1,3,figsize=(12,4),constrained_layout=True)
-        for ax,family in zip(axes,FAMILIES):
-            for j,regime in enumerate(regimes):
-                values=[r['metrics']['f1'] for r in data if r['regime']==regime and r['test_family']==family]
-                ax.scatter(np.full(len(values),j)+np.linspace(-.1,.1,len(values)),values,s=25,color=COLORS.get(regime,'#8559a8'))
-                ax.plot([j-.25,j+.25],[np.mean(values)]*2,color='black')
-            ax.set_xticks(range(5),['Square','Hex','Random','Wide random','Dense random'],rotation=35,ha='right'); ax.set(title=f'{family} test',ylabel='F1'); ax.grid(axis='y',alpha=.2)
-        self.save(12,fig,dict(results=data,histories=histories),f'New controlled repeat-training experiment: {self.args.training_samples} training and {self.args.training_validation_samples} validation images of {self.args.training_size} by {self.args.training_size} pixels per regime; {len(self.args.training_seeds)} initialization seeds; up to {self.args.training_epochs} epochs. Dots are individual training runs, horizontal lines their means. All models share architecture, optimizer, stopping rule and fixed test threshold 0.35. Test images are paired across runs. Wide/dense random regimes change width/spacing or packing distributions. These compact-image SI runs assess seed and distribution effects; they are not retraining replicas of the 512-pixel manuscript experiments, and density remains a measured covariate.')
-        fig,axes=plt.subplots(2,3,figsize=(12,7),constrained_layout=True)
-        for ax,regime in zip(axes.flat,regimes):
-            for color_index,seed in enumerate(self.args.training_seeds):
-                color=plt.get_cmap('tab10')(color_index)
-                hist=histories[f'{regime}/{seed}']; ax.plot(range(1,len(hist['train'])+1),hist['train'],alpha=.65,color=color)
-                ax.plot(range(1,len(hist['validation'])+1),hist['validation'],'--',label=f'seed {seed}',color=color)
-            ax.set_title(regime); basic_axes(ax,'Epoch','Loss'); ax.legend(fontsize=7)
-        axes[1,2].axis('off'); axes[1,2].text(0,.9,'Solid: training\nDashed: validation\n\nExact configurations, histories,\nseeds and checkpoint hashes\nare recorded in source data.',va='top')
-        self.save(12,fig,histories,'All new supplemental training histories. Solid curves show training and dashed curves validation. Seed labels denote initialization and shuffle seeds; generated datasets are held fixed within each regime. Selected checkpoints and timing are recorded per run.', '-b')
-
-    def s13(self):
-        record=self.experimental()[-1]; image=record['image']
-        image=mainfig._interpolate_image(image,(768,768))
-        start=time.perf_counter(); whole=self.predict('random',image); whole_seconds=time.perf_counter()-start
-        tiled=mainfig._predict_tiled(self.model('random'),image,self.device,256,96,1)
-        diff=np.abs(whole-tiled); pred_whole=extract_subpixel_peak_positions(whole); pred_tiled=extract_subpixel_peak_positions(tiled)
-        match=match_coordinate_sets(pred_tiled,pred_whole,3.)
-        starts=mainfig._tile_starts(768,256,160)
-        seam=np.zeros_like(image,bool)
-        for k in starts[1:]: seam[max(0,k-3):k+4,:]=True; seam[:,max(0,k-3):k+4]=True
-        fig,axes=plt.subplots(1,3,figsize=(12,4),constrained_layout=True)
-        show(axes[0],image,'Large-field input'); show(axes[1],tiled,'Overlapping tiled prediction')
-        im=axes[2].imshow(diff,cmap='magma'); axes[2].set_title('Absolute tiled - whole difference'); axes[2].set_xticks([]); axes[2].set_yticks([]); fig.colorbar(im,ax=axes[2],shrink=.7)
-        data=dict(image_shape=image.shape,tile_size=256,overlap=96,source=record['path'],mean_abs=float(diff.mean()),max_abs=float(diff.max()),seam_mean_abs=float(diff[seam].mean()),nonseam_mean_abs=float(diff[~seam].mean()),coordinate_agreement=compact_match(match),whole_inference_or_cache_seconds=whole_seconds)
-        self.save(13,fig,data,'Whole-image versus Hann-weighted overlapping tiled inference on the same 768-pixel experimental view. Tile size 256, overlap 96; coordinate agreement uses a 3-pixel radius and does not constitute experimental accuracy. Error is evaluated both near tile starts and elsewhere; outer-image padding can also contribute. Timing includes possible prediction-cache lookup and is not presented as a speed benchmark.')
-        data=[]; fig,axes=plt.subplots(1,3,figsize=(12,3.5),constrained_layout=True)
-        for i in range(self.args.replicates):
-            cfg=replace(self.configs['random'],image_shape=(128,128),min_atoms=50,max_atoms=65,total_counts_range=(256.,256.),read_noise_std_range=(.02,.02),sigma_range=(1.7,2.3))
-            rec=self.record('random','test',i+4000,cfg); heat=self.predict('random',rec['image'])
-            initial=extract_subpixel_peak_positions(heat); refined,success=refine_gaussians(rec['image'],initial)
-            before=match_coordinate_sets(initial,rec['coordinates'],3.); after=match_coordinate_sets(refined,rec['coordinates'],3.)
-            # Comparison holds the initial accepted correspondence fixed, rather
-            # than silently discarding fits that move outside the match gate.
-            ids=cKDTree(initial).query(before['matched_predicted'])[1] if before['tp'] else np.array([],int)
-            paired_errors=np.linalg.norm(refined[ids]-before['matched_truth'],axis=1)
-            data.append(dict(before_errors=before['errors'],after_errors_same_initial_matches=paired_errors,fit_successes=int(success.sum()),fit_attempts=len(success),before=compact_match(before),after=compact_match(after)))
-        initial_errors=np.concatenate([r['before_errors'] for r in data]); final_errors=np.concatenate([r['after_errors_same_initial_matches'] for r in data])
-        axes[0].hist(initial_errors,bins=30,alpha=.6,label='Heatmap centroid'); axes[0].hist(final_errors,bins=30,alpha=.6,label='Gaussian refinement'); axes[0].legend(fontsize=7); basic_axes(axes[0],'Error (px)','Initial matched atoms')
-        axes[1].scatter(initial_errors,final_errors,s=3,alpha=.3); limit=max(initial_errors.max(initial=1),final_errors.max(initial=1)); axes[1].plot([0,limit],[0,limit],'k--'); basic_axes(axes[1],'Initial error (px)','Refined error (px)')
-        axes[2].axis('off'); axes[2].text(0,.9,f'Initial RMSE: {np.sqrt(np.mean(initial_errors**2)):.3f} px\nRefined RMSE: {np.sqrt(np.mean(final_errors**2)):.3f} px\n\nSame initial matched subset\nGaussian + planar background\n11 x 11 pixel fitting window\nFailed fits retain initial position',va='top')
-        self.save(13,fig,data,'Gaussian refinement on independent synthetic images with known centers. A bounded isotropic Gaussian plus planar background is fitted in an 11-pixel window initialized from each Blob-Net heatmap centroid. Paired errors retain the original matched atom identities, including unsuccessful fits (which retain their initial position). Post-fit detection metrics and fit success counts are supplied. This is a favorable Gaussian-model test, not a claim of experimental picometer precision.', '-b')
-
 
 def add_si_scale_bar(ax,pixel_nm,length_nm):
     xmin,xmax=ax.get_xlim();ymax,ymin=ax.get_ylim()
@@ -858,13 +575,6 @@ def add_si_scale_bar(ax,pixel_nm,length_nm):
 
 def log_response(image,sigma):
     return np.maximum(-gaussian_laplace(image,sigma)*sigma**2,0).astype(np.float32)
-
-
-def controlled_config(shape):
-    return syn.ImageFormationConfig(image_shape=shape,sigma_range=(2.,2.),intensity_range=(.8,.8),
-       target_sigma=2.,background_range=(.05,.05),gradient_range=(0.,0.),
-       inhomogeneous_background_range=(0.,0.),low_frequency_noise_range=(0.,0.),
-       read_noise_std_range=(.03,.03),total_counts_range=(64.,64.),blur_sigma_range=(.5,.5),edge_padding=16)
 
 
 def compact_match(result):
@@ -917,46 +627,9 @@ def pristine_edge_coordinates(family,shape):
     keep=(xy[:,0]>=0)&(xy[:,0]<shape[1])&(xy[:,1]>=0)&(xy[:,1]<shape[0]); return xy[keep,::-1]
 
 
-def refine_gaussians(image,positions):
-    refined=np.asarray(positions).copy(); success=np.zeros(len(positions),bool)
-    for i,(y,x) in enumerate(positions):
-        iy,ix=int(round(y)),int(round(x)); y0=max(0,iy-5); y1=min(image.shape[0],iy+6); x0=max(0,ix-5); x1=min(image.shape[1],ix+6)
-        patch=image[y0:y1,x0:x1]; yy,xx=np.mgrid[y0:y1,x0:x1]
-        if min(patch.shape)<7: continue
-        def residual(p):
-            a,cy,cx,s,b,gy,gx=p
-            return (a*np.exp(-((yy-cy)**2+(xx-cx)**2)/(2*s*s))+b+gy*(yy-y)+gx*(xx-x)-patch).ravel()
-        initial=[max(float(patch.max()-patch.min()),.01),y,x,2.,float(patch.min()),0.,0.]
-        fit=least_squares(residual,initial,bounds=([0,y-2,x-2,.5,-1,-.2,-.2],[2,y+2,x+2,5,2,.2,.2]),max_nfev=80)
-        if fit.success and np.all(np.isfinite(fit.x)): refined[i]=fit.x[1:3]; success[i]=True
-    return refined,success
-
-
 def latex_escape(text):
     replacements={'\\':r'\textbackslash{}','&':r'\&','%':r'\%','$':r'\$','#':r'\#','_':r'\_','{':r'\{','}':r'\}','~':r'\textasciitilde{}','^':r'\textasciicircum{}'}
     return ''.join(replacements.get(c,c) for c in str(text))
-
-
-def figure_result_note(number, data):
-    """Short measured-result prose, with no assumptions about favorable outcomes."""
-    if number == 2:
-        return 'The local audit found ' + '; '.join(f"{k}: {v['actual_counts']['train']} training, {v['actual_counts']['val']} validation and {v['actual_counts']['test']} test images" for k,v in data['audit'].items()) + '. No complete provenance to all archived training runs is asserted.'
-    if number == 3:
-        return 'Selected checkpoint epochs were ' + ', '.join(f"{LABELS[k]} {v['metrics']['best_epoch']}" for k,v in data.items()) + '.'
-    if number == 4:
-        return 'Pooled F1 for Blob-Net in this new evaluation was ' + ', '.join(f"{data[k]['random']['pooled']['f1']:.3f} on {k}" for k in FAMILIES) + '. Paired confidence intervals are reported in the source data; these results use current saved SI configurations, not an authenticated reconstruction of the original evaluation.'
-    if number == 5:
-        return 'Validation-selected thresholds (Square-Net, Hex-Net, Blob-Net) were ' + '; '.join(k+': '+', '.join(f"{v[m]['validation_threshold']:.3f}" for m in FAMILIES) for k,v in data.items()) + '. The test curves should be used to assess the range of settings over which any ranking persists.'
-    if number == 7:
-        rows=[r for r in data if r['model']=='random' and r['std'] in (0.,2.5)]
-        return 'In the controlled displacement experiment, Blob-Net matched-subset RMSE was ' + ', '.join(f"{r['metrics']['rmse']:.3f} px at displacement SD {r['std']:g} px" for r in rows) + '. This experiment does not reproduce the improved Blob-Net localization seen in the cross-material graphene comparison; displacement alone is not an established explanation for that improvement.'
-    if number == 8:
-        return 'The nominal SI protocol produced ' + '; '.join(f"{r['name'].split(' - ')[0]}: {len(r['blob_only'])} Blob-Net-only and {len(r['hex_only'])} Hex-Net-only detections" for r in data) + '. These are disagreements, not verified true or false detections.'
-    if number == 12:
-        return f"The controlled training experiment contains {len(data['histories'])} completed runs. It uses compact crops and is reported separately from the original manuscript training histories."
-    if number == 13:
-        return f"Mean absolute tiled/whole heatmap difference was {data['mean_abs']:.6f}; maximum difference was {data['max_abs']:.6f}. The matching analysis found {data['coordinate_agreement']['tp']} shared coordinate detections."
-    return ''
 
 
 def write_tables(study):
@@ -1012,72 +685,14 @@ Gaussian refinement & 11-pixel windows; isotropic Gaussian plus planar backgroun
     (study.doc/'sections/tables.tex').write_text(text)
 
 
-def additional_panels(study):
-    path=study.out/'data/fig-S04.json'
-    if path.exists():
-        data=json.loads(path.read_text())['data']
-        fig,axes=plt.subplots(1,3,figsize=(10,3.5),constrained_layout=True)
-        for ax,family in zip(axes,FAMILIES):
-            rr=data[family]['paired_F1_difference']
-            mean=np.array([rr[m][0] for m in ('square','hexagonal')]); lo=np.array([rr[m][1] for m in ('square','hexagonal')]); hi=np.array([rr[m][2] for m in ('square','hexagonal')])
-            ax.errorbar(range(2),mean,yerr=[mean-lo,hi-mean],fmt='o',capsize=5,color=COLORS['random'])
-            ax.axhline(0,color='black',lw=.7); ax.set_xticks(range(2),['vs Square','vs Hex']); ax.set_title(family); ax.set_ylabel('Paired F1 difference: Blob-Net - comparator'); ax.grid(axis='y',alpha=.2)
-        study.save(4,fig,{k:v['paired_F1_difference'] for k,v in data.items()},'Mean paired per-image F1 differences with 95% percentile bootstrap intervals (2,000 resamples of images, preserving model pairing). Positive differences favor Blob-Net. These quantify image sampling uncertainty for the fixed archived checkpoints, not variability across training runs.', '-b')
-    path=study.out/'data/fig-S06.json'
-    if path.exists():
-        data=json.loads(path.read_text())['data'];fig,axes=plt.subplots(1,3,figsize=(10,3.5),constrained_layout=True)
-        for ax,(family,values) in zip(axes,data.items()):
-            bins=np.array(values['bins_px']);centers=(bins[:-1]+bins[1:])/2
-            for m in FAMILIES:
-                rms=[np.nan if v is None else v for v in values['models'][m]['rmse']]
-                ax.plot(centers,rms,'o-',color=COLORS[m],label=LABELS[m])
-            ax.axvline(0,color='black',ls=':');ax.set_title(family);basic_axes(ax,'Signed boundary distance (px)','Matched RMSE (px)')
-        axes[0].legend(fontsize=7)
-        study.save(6,fig,data,'Localization error versus signed material-boundary distance for the same edge experiment as S6. Bins without matched atoms are undefined and are left blank. RMSE is conditional on detection; it should be read together with the recall and false-positive curves.', '-b')
-    path=study.out/'data/fig-S09.json'
-    if path.exists():
-        data=json.loads(path.read_text())['data'];fig,axes=plt.subplots(2,2,figsize=(9,7),constrained_layout=True)
-        for row,protocol in enumerate(('resampled','regenerated')):
-            for m in FAMILIES:
-                rr=[r for r in data if r['model']==m and r['protocol']==protocol and r['mode']=='fixed']
-                axes[row,0].plot([r['factor'] for r in rr],[r['metrics']['precision'] for r in rr],'o-',color=COLORS[m],label=LABELS[m])
-                axes[row,1].plot([r['factor'] for r in rr],[r['metrics']['tp'] for r in rr],'o-',color=COLORS[m])
-            for col,metric in enumerate(('Precision','Matched atoms (pooled TP)')):
-                basic_axes(axes[row,col],'Physical pixel-size factor',metric);axes[row,col].set_title(protocol)
-        axes[0,0].legend(fontsize=7)
-        study.save(9,fig,data,'Precision and numbers of successful matches under the fixed-threshold, fixed-pixel-tolerance protocol from S9. These panels expose survivor selection behind a low matched-subset RMSE at poor recall. The regenerated protocol may change actual atom counts through packing constraints.', '-b')
-
-
-
-    path=study.out/'data/fig-S12.json'
-    if path.exists():
-        histories=json.loads(path.read_text())['data']['histories']
-        regimes=['square','hexagonal','random','wide_random','dense_random']
-        fig,axes=plt.subplots(2,3,figsize=(12,7),constrained_layout=True)
-        for ax,regime in zip(axes.flat,regimes):
-            runs=sorted((k,v) for k,v in histories.items() if k.startswith(regime+'/'))
-            for color_index,(key,hist) in enumerate(runs):
-                color=plt.get_cmap('tab10')(color_index)
-                ax.plot(range(1,len(hist['train'])+1),hist['train'],color=color,alpha=.65)
-                ax.plot(range(1,len(hist['validation'])+1),hist['validation'],'--',color=color,label=key.split('/')[-1])
-            ax.set_title(regime);basic_axes(ax,'Epoch','Loss');ax.legend(title='Seed',fontsize=7,title_fontsize=7)
-        axes[1,2].axis('off');axes[1,2].text(0,.9,'Solid: training\nDashed: validation\nMatching colors identify the same seed.\n\nExact settings, histories and checkpoint\nhashes accompany every run.',va='top')
-        study.save(12,fig,histories,'All new supplemental training histories. Solid curves show training and dashed curves validation; each initialization seed has the same color in both. Generated datasets are held fixed within each regime. Selected checkpoints and timing are recorded per run.', '-b')
-
-
 def write_document(study):
-    doc=study.doc; completed=[]; sections=[]; writeup=[]
-    for number in range(1,14):
-        if number == 2: continue  # Omitted from the SI at author request.
-        paths=sorted((study.out/'data').glob(f'fig-S{number:02d}*.json'), key=lambda p: (len(p.stem),p.stem))
-        if number in (4, 5, 8): paths = paths[:1]
+    doc=study.doc; completed=[1] if (doc/'figures/fig-S01.png').is_file() else []; sections=[]; writeup=[]
+    for number in range(2,12):
+        paths=list((study.out/'data').glob(f'fig-S{number:02d}.json'))
         if not paths: continue
         completed.append(number)
         primary=json.loads(paths[0].read_text())
-        result_note=figure_result_note(number,primary['data'])
         writeup.append(f'## Figure S{number}: {TITLES[number]}\n')
-        if result_note:
-            writeup.append(result_note+'\n')
         for j,path in enumerate(paths):
             payload=json.loads(path.read_text()); caption=payload['caption']; stem=path.stem
             source_figure=study.out/'figures'/f'{stem}.png'
@@ -1096,7 +711,6 @@ def write_document(study):
             else:
                 sections.append(r'\caption*{\textbf{Figure S'+str(number)+', continued.} '+latex_escape(caption)+'}\n')
             sections.append(r'\endgroup'+'\n')
-            if j==0 and result_note: sections.append(latex_escape(result_note)+'\n')
             if j == 0: writeup.append(caption.split('. ')[0]+'.\n')
     (doc/'sections/supplementary_figures.tex').write_text('\n'.join(sections))
     table_rows=[]
@@ -1106,14 +720,14 @@ def write_document(study):
     methods=r'''\section*{Scope and reproducibility}
 This supplement accompanies \emph{Geometry-Agnostic Atom Localization from Aperiodic Training Data with Blob-Net}. It documents recovered training records and new controlled analyses. All supplemental figures are generated by a separate script, with outputs isolated from the main manuscript. Source data include exact settings, image-level metrics, checkpoint hashes and source-code hashes.
 
-The original manuscript-model checkpoints are read from the archived Square-Net, Hex-Net and Blob-Net runs. The authors report that original data generation and training were performed on a different computer. Transferred checkpoints, configurations and histories document those runs; the small local dataset copies must not be interpreted as their training sets. Locally available dataset manifests do not establish a complete chain of provenance to those checkpoints. Accordingly, the dataset audit reports the available files as a local snapshot, while new synthetic evaluations explicitly identify their configurations and independent seeds. New compact-image training runs are supplementary controls, not replicas of the original 512-pixel training experiments.
+The original manuscript-model checkpoints are read from the archived Square-Net, Hex-Net and Blob-Net runs. The authors report that original data generation and training were performed on a different computer. Transferred checkpoints, configurations and histories document those runs; the small local dataset copies must not be interpreted as their training sets. New synthetic evaluations explicitly identify their configurations and independent seeds.
 
 \section*{Image formation and evaluation}
 Synthetic inputs sum isotropic Gaussian atomic features; targets use a pixelwise maximum of fixed-width Gaussians. Background, blur, Poisson sampling and additive read noise follow the production renderer. The Poisson parameter controls peak-intensity count scale rather than total electron dose. No multislice scattering or detector calibration is asserted.
 
 Unless otherwise stated, localization uses a threshold of 0.35 relative to the heatmap maximum, a 3-pixel minimum peak separation, a 5-pixel centroid window and a 3-pixel Hungarian matching tolerance. Localization RMSE is conditional on true-positive matches. Missing matches therefore cannot be interpreted as zero localization error. Paired comparisons use the same images for each model. Confidence intervals resample images rather than treating atomic columns as independent experiments.
 
-Validation seeds begin at 7,000,000 and test seeds at 8,000,000. Edge validation and test realizations use separate 9,000,000 and 10,000,000 ranges. Further controlled experiments use the explicit seed offsets in their source data. Threshold selection uses validation data; test-set curves are descriptive sensitivity analyses. The main Figure 2 threshold-selection procedure is disclosed in S5, including its use of a Blob-Net advantage criterion on the displayed examples.
+Validation seeds begin at 7,000,000 and test seeds at 8,000,000. Edge validation and test realizations use separate 9,000,000 and 10,000,000 ranges. Further controlled experiments use the explicit seed offsets in their source data. Threshold selection uses validation data; test-set curves are descriptive sensitivity analyses.
 
 \section*{Recovered model histories}
 \begin{table}[!htbp]\centering\small
@@ -1158,11 +772,11 @@ The bottleneck receptive field is 68 pixels. Decoder operations enlarge output s
 \end{document}
 '''
     (doc/'supplementary_information.tex').write_text(header)
-    missing=[n for n in range(1,14) if n not in completed]
+    missing=[n for n in range(1,12) if n not in completed]
     (doc/'SI_writeup.md').write_text('# Blob-Net supplemental information\n\n'+
       'This is a working SI with measured results, not a claim that every main-text assertion has been confirmed. '+
       (f'All {len(completed)} requested figure groups have been generated.\n\n' if not missing else f'Completed figure groups: {completed}. Remaining: {missing}.\n\n')+
-      '\n'.join(writeup)+'\n## Outstanding scientific provenance\n\nOriginal data generation and training took place on another computer, as confirmed by the author. The complete original NPZ datasets are not available in this local workspace. Experimental material identity and independent annotations require author input. New compact training controls do not replace full-scale repeats. The supplement must be read alongside these limitations.\n')
+      '\n'.join(writeup)+'\n## Outstanding scientific provenance\n\nOriginal data generation and training took place on another computer, as confirmed by the author. The complete original NPZ datasets are not available in this local workspace. Experimental material identity and independent annotations require author input. The supplement must be read alongside these limitations.\n')
     shutil.copy2(study.out/'run_manifest.json',doc/'run_manifest.json')
     for filename in ('author_source_context.json','test_results.txt'):
         if (study.out/filename).exists(): shutil.copy2(study.out/filename,doc/filename)
@@ -1178,8 +792,8 @@ The bottleneck receptive field is 68 pixels. Decoder operations enlarge output s
 
 def parse_args():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--start-at',type=int,default=1,choices=range(1,14),help='First figure when running all; earlier cached results remain available.')
-    parser.add_argument('--figure',default='all',choices=['all','document','gold']+[str(i) for i in range(1,14)])
+    parser.add_argument('--start-at',type=int,default=1,choices=range(1,12),help='First figure when running all; earlier cached results remain available.')
+    parser.add_argument('--figure',default='all',choices=['all','document','gold']+[str(i) for i in range(1,12)])
     parser.add_argument('--output-dir',type=Path,default=ROOT/'outputs/supplemental_information_20260913')
     parser.add_argument('--document-dir',type=Path,default=ROOT/'outputs/supplemental_information_20260913/document')
     parser.add_argument('--model-dir',type=Path,default=ROOT/'artifacts/manuscript_models')
@@ -1187,31 +801,21 @@ def parse_args():
     parser.add_argument('--samples',type=int,default=256)
     parser.add_argument('--validation-samples',type=int,default=8)
     parser.add_argument('--replicates',type=int,default=16)
-    parser.add_argument('--training-size',type=int,default=128)
-    parser.add_argument('--training-samples',type=int,default=512)
-    parser.add_argument('--training-validation-samples',type=int,default=128)
-    parser.add_argument('--training-test-samples',type=int,default=128)
-    parser.add_argument('--training-epochs',type=int,default=20)
-    parser.add_argument('--training-seeds',type=int,nargs='+',default=[0,1,2])
     args=parser.parse_args()
-    for name in ('samples','validation_samples','replicates','training_samples','training_validation_samples','training_test_samples','training_epochs'):
+    for name in ('samples','validation_samples','replicates'):
         if getattr(args,name)<1: parser.error(f'{name} must be positive')
-    if args.training_size<64 or args.training_size%8: parser.error('training-size must be >=64 and divisible by 8')
     return args
 
 
 def main():
     args=parse_args(); study=Study(args)
-    numbers=([number for number in range(args.start_at,14) if number != 2]
-             if args.figure=='all' else [] if args.figure in {'document','gold'} else [int(args.figure)])
-    if args.figure in {'all', 'gold'}:
-        print('Starting gold/TiO2 supplemental figure', flush=True)
-        make_gold_tio2_figure(study)
+    numbers=(list(range(args.start_at,12)) if args.figure=='all'
+             else [] if args.figure=='document' else [1] if args.figure=='gold'
+             else [int(args.figure)])
     for number in numbers:
         print(f'Starting S{number}: {TITLES[number]}',flush=True)
         getattr(study,f's{number}')()
         write_document(study)
-    additional_panels(study)
     write_document(study)
     return 0
 

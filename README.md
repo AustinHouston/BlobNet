@@ -171,7 +171,6 @@ configs/
 scripts/
   generate_training_dataset.py
   train_unet.py
-  check_mps.py
 notebooks/                   dataset and experimental-image exploration
 experimental_data/           tracked publication-ready HDF5 images
 artifacts/manuscript_models/ exact publication checkpoints and training records

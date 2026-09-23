@@ -52,8 +52,6 @@ Useful subcommands:
 
 - `figure1`: synthetic training geometry/generalization figure.
 - `figure3`: experimental HAADF input/output figure.
-- `figure3-localizations`: experimental HAADF localization comparison with
-  BlobNet and a LoG baseline under Poisson noise.
 - `figure4`: scale and spacing robustness figure.
 - `figure2`: edge-structure TP/FP/FN diagnostics.
 - `all`: regenerate the standard manuscript figure set.
@@ -102,42 +100,6 @@ Standard Figure 3:
 ```powershell
 uv run blobnet-manuscript-figures figure3 --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
 ```
-
-Experimental localization comparison:
-
-```powershell
-uv run blobnet-manuscript-figures figure3-localizations --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS
-```
-
-The localization comparison uses the same Figure 3-style experimental inputs in
-the first row, then overlays BlobNet peaks and LoG blob detections on clean and
-Poisson-noised variants.
-
-Important options for `figure3-localizations`:
-
-- `--checkpoint`: BlobNet checkpoint. Default:
-  `artifacts/manuscript_models/figure3_random/unet_best.pth`.
-- `--data-dir`: experimental `.h5` directory. Default: `experimental_data`.
-- `--experimental-measurements`: feature measurement JSON path.
-- `--feature-match-sigma-px`: target feature sigma in pixels. Default: `2.9`.
-- `--experimental-crop-size`: output crop size. Default: `512`.
-- `--poisson-counts`: moderate noisy row count level.
-- `--heavy-poisson-counts`: high-noise row count level. Use a very small value
-  such as `0.35` when the last row should show barely visible structure.
-- `--localization-threshold-rel`: BlobNet peak threshold relative to prediction
-  maximum.
-- `--log-sigma-px`: LoG detector sigma.
-- `--log-threshold-rel`: LoG peak threshold relative to LoG response maximum.
-- `--max-peaks`: optional cap on plotted detections.
-
-Example with a barely visible high-noise final row:
-
-```powershell
-uv run blobnet-manuscript-figures figure3-localizations --output-dir outputs/manuscript_figures_YYYYMMDD_HHMMSS --heavy-poisson-counts 0.35
-```
-
-Generated files include a PNG figure and a JSON summary with detection counts
-and prediction statistics.
 
 ## Editing Figure Code
 
