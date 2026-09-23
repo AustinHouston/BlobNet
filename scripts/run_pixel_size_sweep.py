@@ -363,7 +363,7 @@ def _parse_float_list(value: str) -> list[float]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Generate synthetic pixel-size sweep samples, test BlobNet, and write sweep metrics.')
     parser.add_argument('--output-dir', type=Path, default=Path('outputs/blobnet_pixel_size_sweep_random_4x'))
-    parser.add_argument('--checkpoint', type=Path, default=Path('outputs/inhom_background_unet_20epoch/unet/unet_best.pth'))
+    parser.add_argument('--checkpoint', type=Path, default=Path('artifacts/manuscript_models/random/unet_best.pth'))
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda', 'mps'], default='auto')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--samples-per-size', type=int, default=64)

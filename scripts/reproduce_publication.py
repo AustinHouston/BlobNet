@@ -22,7 +22,6 @@ EXPECTED_CHECKPOINTS = {
     "square": "7ca9e7beadff12a0b4bbafc4116029c257b101d950881e9fd5c6f14a2f32c3b5",
     "hexagonal": "9f03deaf71884a852aaf52250d4f3e0a29f90da2db9519687ab083facc67a3d0",
     "random": "2fa1cfd6caba4de9a3d5f1d5728d33266397c0b882d78d7d3dd600dadabfd041",
-    "random_dense": "0d7c9838668c496a559df4d54e09280c83f312649a4658eebd1b522d61128ac1",
     "figure3_random": "7c4ef2d4e31445606cae11d5dfec3ddf57d68d8c1981953bba0137b8dc242ba1",
     "figure3_hexagonal": "70ede8a0a245c78bb98c9d1ea8672cc55f650e55d3a964357ff49be70e6e90e6",
 }

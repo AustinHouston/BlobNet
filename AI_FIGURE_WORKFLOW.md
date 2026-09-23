@@ -55,7 +55,6 @@ Useful subcommands:
 - `figure3-localizations`: experimental HAADF localization comparison with
   BlobNet and a LoG baseline under Poisson noise.
 - `figure4`: scale and spacing robustness figure.
-- `ws2-edge-comparison`: auxiliary simulated WS2 edge model comparison.
 - `figure2`: edge-structure TP/FP/FN diagnostics.
 - `all`: regenerate the standard manuscript figure set.
 
