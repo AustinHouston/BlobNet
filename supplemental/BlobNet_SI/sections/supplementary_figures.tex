@@ -1,0 +1,163 @@
+\clearpage
+\setcounter{section}{1}
+\setcounter{figure}{1}
+
+
+
+
+\section{Square image formation and target construction}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S01.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Example workflow for image generation in the square dataset. Read the panels from left to right and top to bottom: ideal atomic contrast is combined with a varying background, smooth noise, blur, Poisson noise, and read noise to produce the final input. The colored target marks the atom centers that the model is asked to recover; its peak widths do not follow the variations in brightness and width of the input atoms. Each panel has its own display range so that weak contributions remain visible. The examples show 128-pixel crops.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{2}
+\setcounter{figure}{2}
+\section{Hexagonal image formation and target construction}
+
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S01-b.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Example workflow for image generation in the hexagonal dataset. Read the panels from left to right and top to bottom: ideal atomic contrast is combined with a varying background, smooth noise, blur, Poisson noise, and read noise to produce the final input. The colored target marks the atom centers that the model is asked to recover; its peak widths do not follow the variations in brightness and width of the input atoms. Each panel has its own display range so that weak contributions remain visible. The examples show 128-pixel crops.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{3}
+\setcounter{figure}{3}
+\section{Random image formation and target construction}
+
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S01-c.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Example workflow for image generation in the random dataset. Read the panels from left to right and top to bottom: ideal atomic contrast is combined with a varying background, smooth noise, blur, Poisson noise, and read noise to produce the final input. The colored target marks the atom centers that the model is asked to recover; its peak widths do not follow the variations in brightness and width of the input atoms. Each panel has its own display range so that weak contributions remain visible. The examples show 128-pixel crops.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{4}
+\setcounter{figure}{4}
+
+
+
+
+\section{Training histories and checkpoint selection}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S03.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Training and validation losses show how each model learned its corresponding synthetic dataset. Solid curves show training loss and dashed curves show validation loss; lower values indicate closer agreement with the target heatmaps. Dotted vertical lines identify the lowest-validation-loss models used for evaluation: epoch 19 for Square-Net, 13 for Hex-Net, and 15 for Blob-Net. The three panels use different training geometries, so their absolute loss values should not be read as a ranking of localization accuracy.}
+
+\endgroup
+
+
+\clearpage
+\setcounter{section}{5}
+\setcounter{figure}{5}
+
+
+
+
+\section{Paired cross-geometry generalization}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S04.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Blob-Net retains high detection accuracy across square, hexagonal, and random atom arrangements. Each row tests one arrangement, while the columns show precision (the fraction of detections that are correct), recall (the fraction of atoms recovered), F1 (their combined score), and localization error among matched atoms. The geometry-specific models perform well on their corresponding periodic patterns but lose detection accuracy on random arrangements. Boxes summarize results across 256 test images per arrangement, with all three models evaluated on the same images. Higher precision, recall, and F1 are better; lower localization error is better.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{6}
+\setcounter{figure}{6}
+
+
+
+
+\section{Synthetic edges and boundary-localized errors}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio,trim=0bp 0bp 249.835bp 0bp,clip]{fig-S06.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Comparing model predictions across material boundaries shows that Blob-Net predictions drop off faster than geometric models. Rows show simulated MoS$_2$, SrTiO$_3$, and graphene. From left to right, the panels show the material mask, a noisy image with retained atom positions, the original lattice sites (gray) and retained atoms (orange), and the density of false detections as a function of distance from the boundary. Zero marks the boundary; negative distances are outside the material and positive distances are inside. Peaks near zero reveal detections concentrated around the edge, while nonzero values at negative distances indicate detections outside the material. The relative performance of the models changes between these examples; no model has the fewest false detections at every distance. Curves combine 16 noisy realizations of each fixed boundary shape and report false detections per 10,000 pixels.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{7}
+\setcounter{figure}{7}
+
+
+
+
+\section{Experimental preprocessing and disagreement atlas}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S08.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Preprocessing and model response for the four experimental structures in main Figure 3. Rows show MoS$_2$, a $\Sigma3$ twin boundary in FCC-Al, a high-angle grain boundary in WS$_2$, and an Al$_{72}$Ni$_{11}$Co$_{17}$ quasicrystal. Columns show the raw image, the background-suppressed input shared by both models, and the Blob-Net and Hex-Net output heatmaps. Bright peaks indicate candidate atom positions. Reading across a row shows how preprocessing changes the visible contrast and where the models produce similar or different responses. These heatmaps support a visual comparison; without independently known atom positions, a brighter peak or an extra detection does not establish greater accuracy. Scale bars, 1 nm.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{8}
+\setcounter{figure}{8}
+
+
+
+
+\section{Image sampling and scale sensitivity}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-scale-readable.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Changing image sampling reduces detection accuracy, and threshold tuning only partly compensates for it. The same synthetic scenes are resampled while preserving the field of view and atom positions. A pixel-size ratio of 1 is the reference sampling (vertical dotted line); larger ratios mean coarser sampling and smaller atom features in pixels. Blue, orange, and green curves represent Square-Net, Hex-Net, and Blob-Net. The top row shows detection F1; the bottom row shows localization error for successfully matched atoms, expressed in physical units. \textbf{a,} The detection threshold and three-pixel matching distance are unchanged. \textbf{b,} Only the detection threshold is retuned using separate validation images: this improves some scores but does not restore accuracy across the scale range. \textbf{c,} The detection threshold is unchanged, but the matching distance is adjusted to represent the same physical distance at every scale. This comparison exposes the increasingly permissive physical matching criterion in a at coarse sampling. The lower error in c must be read together with its lower F1: a stricter matching criterion excludes larger errors rather than improving the predictions. All curves use the same test scenes and model predictions. The physical conversion uses a nominal reference spacing of 0.106223~\AA{} per pixel for these synthetic images.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{9}
+\setcounter{figure}{9}
+
+
+\section{Theoretical receptive field}
+
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S10-rf.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{The network combines information over a progressively larger neighborhood as the image passes through the encoder. Each point gives the side length of the input region that can influence one feature at the indicated layer. Convolutions and pooling expand this theoretical receptive field from one pixel at the input to 68 pixels at the bottleneck. This is a geometric property of the architecture, not a measurement of how strongly each surrounding pixel affects a prediction.}
+
+\endgroup
+
+\clearpage
+\setcounter{section}{10}
+\setcounter{figure}{10}
+
+
+
+
+\section{Noise robustness and a classical baseline}
+
+\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{fig-S11.png}}
+
+\begingroup\captionsetup{type=figure}
+
+\caption{Blob-Net usually detects atoms more accurately than a conventional Laplacian-of-Gaussian (LoG) blob detector in these synthetic noise tests, but its advantage narrows at the highest read noise. Green curves show Blob-Net and purple curves show LoG. Columns vary the Poisson count scale, read-noise amplitude, and strength of a slowly varying background, respectively; only one factor is varied at a time. In the left column, larger count scales mean less relative counting noise, so performance improves toward the right. In the middle column, increasing read noise reduces detection accuracy and increases position error for both methods. Background variation has a smaller effect on detection over the tested range. The top row shows F1 (higher is better); the bottom row shows position error among matched atoms (lower is better). Blob-Net does not have the lowest position error in every condition. Each method is tuned on separate validation images before testing, so this compares their calibrated performance rather than their default settings. The Poisson count scale is a synthetic noise parameter, not a calibrated microscope dose.}
+
+\endgroup

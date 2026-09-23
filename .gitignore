@@ -7,7 +7,6 @@ dist/
 .venv/
 examples/
 outputs/
-supplemental/
 experimental_data/*
 !experimental_data/README.md
 !experimental_data/*.h5
@@ -16,6 +15,7 @@ experimental_data/*
 *.png
 !artifacts/
 !artifacts/**
+!supplemental/**/*.png
 publication/manuscript/manuscript.aux
 publication/manuscript/manuscript.bbl
 publication/manuscript/manuscript.blg

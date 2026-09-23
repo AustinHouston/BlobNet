@@ -20,9 +20,12 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import patheffects
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
 import yaml
+import h5py
 from scipy.ndimage import distance_transform_edt, gaussian_filter, gaussian_laplace, zoom
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
@@ -138,6 +141,122 @@ def basic_axes(ax, xlabel, ylabel):
     ax.set(xlabel=xlabel, ylabel=ylabel); ax.grid(alpha=.2)
 
 
+def make_gold_tio2_figure(study):
+    """Generate the four-panel Au-in-TiO2 figure used at the start of the SI."""
+    image_path = ROOT / 'experimental_data/gold_implanted_in_TiO2.h5'
+    with h5py.File(image_path, 'r') as handle:
+        full_image = np.asarray(handle['image'], dtype=np.float32)
+        pixel_size_nm = float(handle['image'].attrs['pixel_size_nm'])
+    raw = full_image[256:768, 256:768]
+    field = gaussian_filter(raw, 5, mode='reflect')
+    field_median = float(np.median(field))
+    corrected = raw / np.maximum(field, 0.05 * field_median) * field_median
+    normalized = mainfig._normalize_image(corrected, low=1.0, high=99.8)
+    processed = mainfig._normalize_image(
+        gaussian_filter(normalized, 1, mode='reflect')
+        - gaussian_filter(normalized, 10, mode='reflect'),
+        low=1.0, high=99.8,
+    )
+    inference = mainfig._normalize_image(
+        mainfig._interpolate_image(processed, (301, 301)), low=1.0, high=99.8
+    )
+    raw_display = mainfig._normalize_image(raw, low=1.0, high=99.8)
+
+    models = [
+        ('Blob-Net', study.args.model_dir / 'random/unet_best.pth', '#E69F00', 36),
+        ('Hex-Net', study.args.model_dir / 'hexagonal/unet_best.pth', '#00BFFF', 18),
+        ('Square-Net', study.args.model_dir / 'square/unet_best.pth', '#CC33CC', 6),
+    ]
+    positions = {}
+    for name, checkpoint, _color, _size in models:
+        model = mainfig._load_blobnet_model(checkpoint, study.device, [32, 64, 128, 256], 0.2)
+        prediction = mainfig._predict_tiled(model, inference, study.device, 256, 64, 4)
+        coordinates = extract_subpixel_peak_positions(
+            prediction, threshold_rel=0.10, min_distance=3, window_size=5
+        )
+        positions[name] = np.asarray(coordinates, dtype=np.float32) * (511.0 / 300.0)
+
+    windows = [(0, 512, 0, 512), (0, 512, 0, 512),
+               (180, 340, 100, 260), (352, 512, 220, 380)]
+    fig, axes = plt.subplots(2, 2, figsize=(10.5, 10.5), constrained_layout=True)
+    for panel, (axis, window) in enumerate(zip(axes.flat, windows)):
+        y0, y1, x0, x1 = window
+        image = raw_display if panel == 0 else processed
+        axis.imshow(image[y0:y1, x0:x1], cmap='gray', vmin=0, vmax=1)
+        if panel:
+            for name, _checkpoint, color, size in models:
+                coordinates = positions[name]
+                inside = ((coordinates[:, 0] >= y0) & (coordinates[:, 0] < y1)
+                          & (coordinates[:, 1] >= x0) & (coordinates[:, 1] < x1))
+                plotted = coordinates[inside] - np.array([y0, x0])
+                scatter = axis.scatter(
+                    plotted[:, 1], plotted[:, 0], s=size * (5 if panel > 1 else 1),
+                    facecolors='none', edgecolors=color,
+                    linewidths=1 if panel > 1 else 0.7,
+                )
+                scatter.set_path_effects([
+                    patheffects.Stroke(
+                        linewidth=1.7 if panel > 1 else 1.15,
+                        foreground='black', alpha=0.65,
+                    ),
+                    patheffects.Normal(),
+                ])
+        axis.set(xticks=[], yticks=[], xlim=(-0.5, x1-x0-0.5), ylim=(y1-y0-0.5, -0.5))
+        axis.set_title(chr(ord('a') + panel), loc='left', fontsize=20, fontweight='bold')
+        mainfig._add_physical_scale_bar(
+            axis, (y1-y0, x1-x0), pixel_size_nm,
+            length_nm=1 if panel < 2 else 0.5, linewidth=3,
+        )
+    for label, window, color in [('c', windows[2], 'white'), ('d', windows[3], '#FF66CC')]:
+        y0, y1, x0, x1 = window
+        axes.flat[1].plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
+                          color=color, linewidth=1.3)
+        axes.flat[1].text(x0+4, y0+17, label, color=color, fontsize=13, fontweight='bold')
+    fig.legend(
+        handles=[Line2D([], [], linestyle='none', marker='o', markerfacecolor='none',
+                        markeredgecolor=color, markersize=np.sqrt(size)+2, label=name)
+                 for name, _checkpoint, color, size in models],
+        loc='outside upper center', ncol=3, frameon=False, fontsize=12,
+    )
+
+    stem = 'fig-S01-au-tio2'
+    for directory in (study.out / 'figures', study.doc / 'figures'):
+        directory.mkdir(parents=True, exist_ok=True)
+        fig.savefig(directory / f'{stem}.png', dpi=300)
+    plt.close(fig)
+    provenance = {
+        'figure': 'S1',
+        'image': str(image_path.relative_to(ROOT)),
+        'image_sha256': digest(image_path),
+        'image_crop_yx': [256, 256, 512, 512],
+        'field_sigma_source_px': 5,
+        'dog_sigmas_source_px': [1, 10],
+        'normalization_percentiles': [1, 99.8],
+        'inference_shape': [301, 301],
+        'threshold_rel': 0.10,
+        'model_sha256': {name: digest(checkpoint) for name, checkpoint, _color, _size in models},
+        'prediction_counts': {name: len(value) for name, value in positions.items()},
+        'layout': '2x2',
+    }
+    arrays = {
+        'background': processed,
+        **{name.replace('-', '_')+'_coordinates_yx': value
+           for name, value in positions.items()},
+    }
+    output_data = study.out / 'data'
+    output_data.mkdir(parents=True, exist_ok=True)
+    dump(output_data / 'gold-au-tio2.json', provenance)
+    np.savez_compressed(output_data / 'gold-au-tio2.npz', **arrays)
+    document_data = study.doc / 'source_data'
+    document_data.mkdir(parents=True, exist_ok=True)
+    dump(document_data / f'{stem}.json', provenance)
+    np.savez_compressed(document_data / f'{stem}.npz', **arrays)
+    section = ROOT / 'supplemental/BlobNet_SI/sections/utkarsh_gold_tio2.tex'
+    if section.is_file():
+        shutil.copy2(section, study.doc / 'sections/utkarsh_gold_tio2.tex')
+    return study.doc / 'figures' / f'{stem}.pdf'
+
+
 class Study:
     def __init__(self, args):
         self.args = args
@@ -210,13 +329,11 @@ class Study:
     def save(self, number, fig, data, caption, suffix=''):
         stem = f'fig-S{number:02d}{suffix}'
         fig.savefig(self.out / 'figures' / f'{stem}.png', dpi=180, bbox_inches='tight')
-        fig.savefig(self.out / 'figures' / f'{stem}.pdf', bbox_inches='tight')
         plt.close(fig)
         payload = dict(title=TITLES[number], caption=caption, data=data, source_sha256=self.source_hashes)
         dump(self.out / 'data' / f'{stem}.json', payload)
         self.results[stem] = payload
-        for ext in ('png', 'pdf'):
-            shutil.copy2(self.out / 'figures' / f'{stem}.{ext}', self.doc / 'figures')
+        shutil.copy2(self.out / 'figures' / f'{stem}.png', self.doc / 'figures')
         print(f'Saved {stem}: {caption[:100]}', flush=True)
 
     def s1(self):
@@ -963,17 +1080,16 @@ def write_document(study):
             writeup.append(result_note+'\n')
         for j,path in enumerate(paths):
             payload=json.loads(path.read_text()); caption=payload['caption']; stem=path.stem
-            for ext in ('pdf','png'):
-                source_figure=study.out/'figures'/f'{stem}.{ext}'
-                target_figure=doc/'figures'/f'{stem}.{ext}'
-                if source_figure.resolve()!=target_figure.resolve(): shutil.copy2(source_figure,target_figure)
+            source_figure=study.out/'figures'/f'{stem}.png'
+            target_figure=doc/'figures'/f'{stem}.png'
+            if source_figure.resolve()!=target_figure.resolve(): shutil.copy2(source_figure,target_figure)
             # Each non-floating figure is followed by its caption and notes;
             # the next sheet starts on a new page.
             sections.append(r'\clearpage'+'\n')
             if j==0:
                 sections.append(r'\setcounter{section}{'+str(number-1)+'}\n')
                 sections.append(r'\section{'+latex_escape(TITLES[number])+'}\n')
-            sections.append(r'\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{'+stem+'.pdf}}\n')
+            sections.append(r'\noindent\makebox[\textwidth]{\includegraphics[width=\textwidth,height=0.62\textheight,keepaspectratio]{'+stem+'.png}}\n')
             sections.append(r'\begingroup\captionsetup{type=figure}'+'\n')
             if j==0:
                 sections.append(r'\setcounter{figure}{'+str(number-1)+'}\n'+r'\caption{'+latex_escape(caption)+'}\n')
@@ -1035,9 +1151,9 @@ The bottleneck receptive field is 68 pixels. Decoder operations enlarge output s
 \date{}
 \begin{document}
 \maketitle
+\IfFileExists{sections/utkarsh_gold_tio2.tex}{\input{sections/utkarsh_gold_tio2}}{}
 \input{sections/methods}
 \input{sections/supplementary_figures}
-\IfFileExists{sections/utkarsh_gold_tio2.tex}{\input{sections/utkarsh_gold_tio2}}{}
 \input{sections/tables}
 \end{document}
 '''
@@ -1063,7 +1179,7 @@ The bottleneck receptive field is 68 pixels. Decoder operations enlarge output s
 def parse_args():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--start-at',type=int,default=1,choices=range(1,14),help='First figure when running all; earlier cached results remain available.')
-    parser.add_argument('--figure',default='all',choices=['all','document']+[str(i) for i in range(1,14)])
+    parser.add_argument('--figure',default='all',choices=['all','document','gold']+[str(i) for i in range(1,14)])
     parser.add_argument('--output-dir',type=Path,default=ROOT/'outputs/supplemental_information_20260913')
     parser.add_argument('--document-dir',type=Path,default=ROOT/'outputs/supplemental_information_20260913/document')
     parser.add_argument('--model-dir',type=Path,default=ROOT/'artifacts/manuscript_models')
@@ -1087,7 +1203,10 @@ def parse_args():
 def main():
     args=parse_args(); study=Study(args)
     numbers=([number for number in range(args.start_at,14) if number != 2]
-             if args.figure=='all' else [] if args.figure=='document' else [int(args.figure)])
+             if args.figure=='all' else [] if args.figure in {'document','gold'} else [int(args.figure)])
+    if args.figure in {'all', 'gold'}:
+        print('Starting gold/TiO2 supplemental figure', flush=True)
+        make_gold_tio2_figure(study)
     for number in numbers:
         print(f'Starting S{number}: {TITLES[number]}',flush=True)
         getattr(study,f's{number}')()

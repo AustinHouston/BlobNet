@@ -97,14 +97,6 @@ def reproduce_si(device: str, compile_latex: bool) -> None:
     run(sys.executable, "-m", "scripts.make_supplemental_figures", "--figure", "all",
         "--device", device, "--output-dir", str(SI_OUTPUT), "--document-dir", str(SI_DOCUMENT),
         "--model-dir", str(MODELS))
-    run(sys.executable, "-m", "scripts.make_utkarsh_si_figure")
-    gold = ROOT / "outputs/utkarsh_si_figure"
-    shutil.copy2(gold / "fig-S17.pdf", SI_DOCUMENT / "figures/fig-S17.pdf")
-    shutil.copy2(gold / "fig-S17.png", SI_DOCUMENT / "figures/fig-S17.png")
-    shutil.copy2(gold / "utkarsh_gold_tio2.tex", SI_DOCUMENT / "sections/utkarsh_gold_tio2.tex")
-    run(sys.executable, "-m", "scripts.make_supplemental_figures", "--figure", "document",
-        "--device", device, "--output-dir", str(SI_OUTPUT), "--document-dir", str(SI_DOCUMENT),
-        "--model-dir", str(MODELS))
     if compile_latex:
         subprocess.run(["latexmk", "-pdf", "-interaction=nonstopmode", "-halt-on-error",
                         "supplementary_information.tex"], cwd=SI_DOCUMENT, check=True)
